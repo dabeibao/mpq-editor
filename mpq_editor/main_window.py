@@ -495,7 +495,11 @@ class MainWindow(QMainWindow):
             self.setStyleSheet("")
             self._theme_btn.setText("☾")
             self._theme_btn.setToolTip("深色主题")
-        self._set_title_bar_theme(theme == "dark")
+
+        is_dark = theme == "dark"
+        self._set_title_bar_theme(is_dark)
+        if self._dc6_viewer:
+            self._dc6_viewer.apply_theme(is_dark)
 
     def _toggle_theme(self):
         self._theme = "light" if self._theme == "dark" else "dark"
@@ -544,5 +548,5 @@ class MainWindow(QMainWindow):
             if viewer is not None:
                 viewer.deleteLater()
             from dc6.dc6_viewer import show_dc6_window
-
-            self._dc6_viewer = show_dc6_window(data, mpq_path, self, enable_directory=False)
+            is_dark = self._theme == "dark"
+            self._dc6_viewer = show_dc6_window(data, mpq_path, self, is_dark=is_dark)

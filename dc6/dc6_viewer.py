@@ -440,9 +440,10 @@ class Dc6Viewer(QMainWindow):
         parent: QWidget | None = None,
         data: bytes | None = None,
         source_path: str | None = None,
-        enable_directory: bool = True,
+        is_dark: bool = False,
     ):
         super().__init__(parent)
+        self._is_dark = is_dark
         self._dc6: Dc6File | None = None
         self._source_path = source_path
         self._current_frame = 0
@@ -483,13 +484,7 @@ class Dc6Viewer(QMainWindow):
         hh.resizeSection(2, 55)
         hh.resizeSection(3, 55)
         self.frame_table.currentCellChanged.connect(self._on_frame_selected)
-        self.frame_table.setStyleSheet("""
-            QTableWidget::item:selected {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-            }
-        """)
-        self.frame_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # self.frame_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.file_list = QListWidget()
         self.file_list.currentItemChanged.connect(self._on_file_list_selected)
@@ -527,6 +522,35 @@ class Dc6Viewer(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.statusBar().showMessage("就绪")
+        self.apply_theme(self._is_dark)
+
+    def apply_theme(self, is_dark):
+        self._is_dark = is_dark
+        style_sheet = self._get_style_sheet()
+        self.frame_table.setStyleSheet(style_sheet)
+
+    def _get_style_sheet(self) -> str:
+        common = """
+        QTableWidget {
+            outline: 0;
+        }
+        """
+        if self._is_dark:
+            return common + """
+            QTableWidget::item:selected,
+            QTableWidget::item:focus {
+                background-color: #303030;
+                border: none;
+            }
+            """
+        else:
+            return common + """
+            QTableWidget::item:selected,
+            QTableWidget::item:focus {
+                background-color: #f5f5f5;
+                color: black;
+            }
+            """
 
     def _setup_actions(self):
         style = self.style()
@@ -1026,9 +1050,10 @@ def show_dc6_window(
     data: bytes,
     source_path: str | None = None,
     parent: QWidget | None = None,
+    is_dark: bool = False,
     enable_directory: bool = True,
 ) -> Dc6Viewer:
-    viewer = Dc6Viewer(parent, data, source_path, enable_directory=enable_directory)
+    viewer = Dc6Viewer(parent, data, source_path, is_dark=is_dark)
     viewer.show()
     return viewer
 
