@@ -483,6 +483,13 @@ class Dc6Viewer(QMainWindow):
         hh.resizeSection(2, 55)
         hh.resizeSection(3, 55)
         self.frame_table.currentCellChanged.connect(self._on_frame_selected)
+        self.frame_table.setStyleSheet("""
+            QTableWidget::item:selected {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+        """)
+        self.frame_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.file_list = QListWidget()
         self.file_list.currentItemChanged.connect(self._on_file_list_selected)
@@ -754,7 +761,7 @@ class Dc6Viewer(QMainWindow):
             with Path(path).open("rb") as f:
                 data = f.read()
             self.load_data(data, path)
-            self._populate_file_list(str(Path(path).parent))
+            self.file_list.clearSelection()
 
     def _save_as(self):
         if not self._dc6:

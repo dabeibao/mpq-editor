@@ -429,7 +429,6 @@ class MainWindow(QMainWindow):
 
     def _init_theme(self):
         app = QApplication.instance()
-        app.setStyle("Fusion")
         self._light_palette = app.palette()
         self._apply_theme(self._theme)
 
