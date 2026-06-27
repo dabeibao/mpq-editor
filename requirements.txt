@@ -1,0 +1,2 @@
+pyside6
+stormlibpy @ git+https://github.com/kirbystealer/StormLibPy.git

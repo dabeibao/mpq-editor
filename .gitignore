@@ -1,0 +1,7 @@
+.*
+!.gitignore
+__pycache__
+*.mpq
+*.ini
+/build
+/dist
