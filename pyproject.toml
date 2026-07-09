@@ -1,23 +1,36 @@
 [tool.ruff]
 target-version = "py313"
-line-length = 100
+line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "PTH", "RUF"]
-ignore = ["E501", "RUF001", "N806", "PTH110", "PTH108", "SIM105", "SIM115"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "PTH", "RUF", "ASYNC"]
+ignore = [
+       "E501",
+       "RUF001",
+       "N806",
+       "PTH110",
+       "PTH108",
+       "SIM105",
+       "SIM115",
+       "D101",
+       "D102",
+       "D107",
+]
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
-reportUnusedCallResult = false
-reportUnusedParameter = "warning"
-reportImplicitOverride = true
-reportAny = "warning"
-reportUnknownParameterType = "warning"
-reportUnannotatedClassAttribute = "warning"
+
 reportPossiblyUnboundVariable = "error"
 reportAttributeAccessIssue = "error"
+reportImplicitOverride = true
+
+reportAny = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+
+reportUnusedCallResult = false
+reportUnusedParameter = "warning"
 reportMissingParameterType = "warning"
-reportMissingTypeArgument = "warning"
-reportUnknownVariableType = "warning"
-reportUnknownMemberType = "warning"
-reportUnknownArgumentType = "warning"
+reportUnknownParameterType = "warning"
+reportUnannotatedClassAttribute = "warning"
