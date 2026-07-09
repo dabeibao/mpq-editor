@@ -9,7 +9,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dc6.dc6_viewer import Dc6File, load_palette, list_palettes, compress_frame  # noqa: E402
+from PySide6.QtGui import QColor, QImage
+
+from dc6.dc6_viewer import (  # noqa: E402
+    Dc6File,
+    FrameInfo,
+    compress_frame,
+    floyd_steinberg_dither,
+    list_palettes,
+    load_palette,
+    split_image_tiles,
+)
 
 
 def make_simple_dc6(width: int, height: int, pixels: bytes | None = None) -> bytes:
@@ -271,3 +281,143 @@ class TestCompressRoundtrip:
         compressed = compress_frame(original, w, h)
         decompressed = self._decompress(compressed, w, h)
         assert bytes(decompressed) == original
+
+
+class TestDither:
+    def test_dither_output_format(self):
+        palette = load_palette("act1")
+        img = QImage(4, 4, QImage.Format.Format_RGB32)
+        for y in range(4):
+            for x in range(4):
+                c = QColor(x * 60, y * 60, 128)
+                img.setPixel(x, y, c.rgb())
+        dithered = floyd_steinberg_dither(img, palette, 100.0)
+        assert dithered.width() == 4
+        assert dithered.height() == 4
+        assert dithered.format() == QImage.Format.Format_Indexed8
+        assert dithered.colorCount() == 256
+
+    def test_dither_zero_ratio(self):
+        palette = load_palette("act1")
+        img = QImage(8, 8, QImage.Format.Format_RGB32)
+        img.fill(QColor(128, 128, 128).rgb())
+        dithered = floyd_steinberg_dither(img, palette, 0.0)
+        assert dithered.width() == 8
+        assert dithered.height() == 8
+        for y in range(8):
+            for x in range(8):
+                idx = dithered.pixelIndex(x, y)
+                assert 0 <= idx < 256
+
+    def test_dither_full_ratio(self):
+        palette = load_palette("act1")
+        img = QImage(8, 8, QImage.Format.Format_RGB32)
+        img.fill(QColor(128, 128, 128).rgb())
+        dithered = floyd_steinberg_dither(img, palette, 100.0)
+        assert dithered.format() == QImage.Format.Format_Indexed8
+
+    def test_dither_max_ratio(self):
+        palette = load_palette("act1")
+        img = QImage(4, 4, QImage.Format.Format_RGB32)
+        for y in range(4):
+            for x in range(4):
+                img.setPixel(x, y, QColor(x * 60, y * 60, 128).rgb())
+        dithered = floyd_steinberg_dither(img, palette, 200.0)
+        assert dithered.width() == 4
+        assert dithered.height() == 4
+
+
+class TestSplitImageTiles:
+    def test_split_small_image(self):
+        img = QImage(100, 100, QImage.Format.Format_Indexed8)
+        img.setColorCount(256)
+        img.fill(0)
+        tiles = split_image_tiles(img, 4)
+        assert len(tiles) == 1
+        assert tiles[0][2] == 100
+        assert tiles[0][3] == 100
+
+    def test_split_large_image(self):
+        img = QImage(512, 256, QImage.Format.Format_Indexed8)
+        img.setColorCount(256)
+        img.fill(0)
+        tiles = split_image_tiles(img, 2)
+        assert len(tiles) == 2
+        assert tiles[0][:4] == (0, 0, 256, 256)
+        assert tiles[1][:4] == (256, 0, 256, 256)
+
+    def test_split_uneven_height(self):
+        img = QImage(512, 384, QImage.Format.Format_Indexed8)
+        img.setColorCount(256)
+        img.fill(0)
+        tiles = split_image_tiles(img, 2)
+        assert len(tiles) == 4
+        assert tiles[0][:4] == (0, 0, 256, 256)
+        assert tiles[1][:4] == (256, 0, 256, 256)
+        assert tiles[2][:4] == (0, 256, 256, 128)
+        assert tiles[3][:4] == (256, 256, 256, 128)
+
+    def test_split_1024x384_fpr2(self):
+        img = QImage(1024, 384, QImage.Format.Format_Indexed8)
+        img.setColorCount(256)
+        img.fill(0)
+        tiles = split_image_tiles(img, 2)
+        assert len(tiles) == 8
+        expected = [
+            (0, 0, 256, 256),
+            (256, 0, 256, 256),
+            (0, 256, 256, 128),
+            (256, 256, 256, 128),
+            (512, 0, 256, 256),
+            (768, 0, 256, 256),
+            (512, 256, 256, 128),
+            (768, 256, 256, 128),
+        ]
+        for i, (ex, ey, ew, eh) in enumerate(expected):
+            assert tiles[i][:4] == (ex, ey, ew, eh), f"Tile {i}: expected {(ex, ey, ew, eh)}, got {tiles[i][:4]}"
+
+
+class TestDc6FileCreation:
+    def test_create_blank(self):
+        dc6 = Dc6File.__new__(Dc6File)
+        dc6.version = 6
+        dc6.termination = b"\xee\xee\xee\xee"
+        dc6.frames = []
+        dc6.palette = b""
+        assert dc6.version == 6
+        assert dc6.total_frames() == 0
+
+    def test_create_blank_then_add_frame(self):
+        dc6 = Dc6File.__new__(Dc6File)
+        dc6.version = 6
+        dc6.termination = b"\xee\xee\xee\xee"
+        dc6.frames = []
+        dc6.palette = b""
+        assert dc6.total_frames() == 0
+        dc6.frames.append(FrameInfo(width=8, height=8, pixels=bytearray(64)))
+        assert dc6.total_frames() == 1
+
+
+class TestDc6FileDeleteFrame:
+    def test_delete_frame(self):
+        data = make_simple_dc6(8, 8)
+        dc6 = Dc6File(data)
+        assert dc6.total_frames() == 1
+        dc6.frames.append(FrameInfo(width=4, height=4, pixels=bytearray(16)))
+        assert dc6.total_frames() == 2
+        del dc6.frames[0]
+        assert dc6.total_frames() == 1
+        assert dc6.frames[0].width == 4
+
+    def test_delete_all_frames(self):
+        f1 = FrameInfo(width=8, height=8, pixels=bytearray(64))
+        f2 = FrameInfo(width=4, height=4, pixels=bytearray(16))
+        dc6 = Dc6File.__new__(Dc6File)
+        dc6.version = 6
+        dc6.termination = b"\xee\xee\xee\xee"
+        dc6.frames = [f1, f2]
+        dc6.palette = b""
+        del dc6.frames[0]
+        assert dc6.total_frames() == 1
+        del dc6.frames[0]
+        assert dc6.total_frames() == 0

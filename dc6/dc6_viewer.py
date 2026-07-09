@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import override
 
-from PySide6.QtCore import QEvent, QSettings, Qt, QSize, QTimer
+from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -22,6 +22,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -39,11 +40,11 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
-    QStyle,
 )
 
 DC6_SIGNATURE = 6
@@ -240,6 +241,105 @@ def make_bmp_data(frame: FrameInfo, palette: bytes) -> bytes:
     return bytes(bmp_header)
 
 
+def floyd_steinberg_dither(img: QImage, palette: bytes, ratio: float) -> QImage:
+    w, h = img.width(), img.height()
+    ratio = max(0.0, min(2.0, ratio / 100.0))
+
+    pal_colors = [(0, 0, 0)] * 256
+    for i in range(256):
+        if i * 3 + 2 < len(palette):
+            b = palette[i * 3]
+            g = palette[i * 3 + 1]
+            r = palette[i * 3 + 2]
+            pal_colors[i] = (r, g, b)
+
+    img_rgba = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    err_cur = [[0.0, 0.0, 0.0] for _ in range(w + 1)]
+    err_next = [[0.0, 0.0, 0.0] for _ in range(w + 1)]
+
+    out = QImage(w, h, QImage.Format.Format_Indexed8)
+    out.setColorCount(256)
+    for i, (r, g, b) in enumerate(pal_colors):
+        out.setColor(i, QColor(r, g, b).rgb())
+
+    for y in range(h):
+        for x in range(w):
+            pixel = img_rgba.pixel(x, y)
+            orig_r = (pixel >> 16) & 0xFF
+            orig_g = (pixel >> 8) & 0xFF
+            orig_b = pixel & 0xFF
+
+            r = orig_r + err_cur[x][0]
+            g = orig_g + err_cur[x][1]
+            b = orig_b + err_cur[x][2]
+
+            r = max(0, min(255, int(r + 0.5)))
+            g = max(0, min(255, int(g + 0.5)))
+            b = max(0, min(255, int(b + 0.5)))
+
+            best_idx = 0
+            best_dist = 3 * 256 * 256
+            for i, (pr, pg, pb) in enumerate(pal_colors):
+                dr = r - pr
+                dg = g - pg
+                db = b - pb
+                dist = dr * dr + dg * dg + db * db
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = i
+
+            out.setPixel(x, y, best_idx)
+
+            qr = (r - pal_colors[best_idx][0]) * ratio
+            qg = (g - pal_colors[best_idx][1]) * ratio
+            qb = (b - pal_colors[best_idx][2]) * ratio
+
+            if x + 1 < w:
+                err_cur[x + 1][0] += qr * 7.0 / 16.0
+                err_cur[x + 1][1] += qg * 7.0 / 16.0
+                err_cur[x + 1][2] += qb * 7.0 / 16.0
+
+            if x > 0 and y + 1 < h:
+                err_next[x - 1][0] += qr * 3.0 / 16.0
+                err_next[x - 1][1] += qg * 3.0 / 16.0
+                err_next[x - 1][2] += qb * 3.0 / 16.0
+
+            if y + 1 < h:
+                err_next[x][0] += qr * 5.0 / 16.0
+                err_next[x][1] += qg * 5.0 / 16.0
+                err_next[x][2] += qb * 5.0 / 16.0
+
+            if x + 1 < w and y + 1 < h:
+                err_next[x + 1][0] += qr * 1.0 / 16.0
+                err_next[x + 1][1] += qg * 1.0 / 16.0
+                err_next[x + 1][2] += qb * 1.0 / 16.0
+
+        err_cur, err_next = err_next, [[0.0, 0.0, 0.0] for _ in range(w + 1)]
+
+    return out
+
+
+def split_image_tiles(img: QImage, frames_per_row: int) -> list[tuple[int, int, int, int, QImage]]:
+    img_w, img_h = img.width(), img.height()
+    tiles: list[tuple[int, int, int, int, QImage]] = []
+    group_width = frames_per_row * 256
+
+    for group_x in range(0, img_w, group_width):
+        for strip_y in range(0, img_h, 256):
+            strip_h = min(256, img_h - strip_y)
+            for i in range(frames_per_row):
+                tile_x = group_x + i * 256
+                if tile_x >= img_w:
+                    break
+                tile_w = min(256, img_w - tile_x)
+                tile_h = strip_h
+                sub = img.copy(tile_x, strip_y, tile_w, tile_h)
+                tiles.append((tile_x, strip_y, tile_w, tile_h, sub))
+
+    return tiles
+
+
 THUMB_HEIGHT = 40
 THUMB_WIDTH = 60
 
@@ -330,6 +430,8 @@ class ExportDialog(QDialog):
         self.rows_spin.setRange(1, total_frames)
         self.rows_spin.setValue(1)
 
+        self.merge_cb = QCheckBox("合并多张图为一张（从左到右）")
+
         def _update_max_rows():
             total_selected = self.count_spin.value()
             max_rows = (total_selected + self.cols_spin.value() - 1) // self.cols_spin.value()
@@ -343,6 +445,7 @@ class ExportDialog(QDialog):
         form.addWidget(self.start_spin)
         form.addWidget(QLabel("帧数:"))
         form.addWidget(self.count_spin)
+        form.addWidget(self.merge_cb)
         form.addWidget(QLabel("每行帧数:"))
         form.addWidget(self.cols_spin)
         form.addWidget(QLabel("行数:"))
@@ -364,13 +467,101 @@ class ExportDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
-    def settings(self) -> tuple[int, int, int, int, str]:
+    def settings(self) -> tuple[int, int, int, int, int, str]:
         return (
             self.start_spin.value(),
             self.count_spin.value(),
             self.cols_spin.value(),
             self.rows_spin.value(),
+            1 if self.merge_cb.isChecked() else 0,
             self.name_edit.text(),
+        )
+
+
+class ImportDialog(QDialog):
+    def __init__(
+        self,
+        img_path: str,
+        img_size: tuple[int, int],
+        palettes: list[str],
+        current_palette: str,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("导入图片")
+        layout = QVBoxLayout(self)
+
+        img_w, img_h = img_size
+        layout.addWidget(QLabel(f"图片: {img_path}"))
+        layout.addWidget(QLabel(f"尺寸: {img_w} x {img_h}"))
+
+        palette_layout = QHBoxLayout()
+        palette_layout.addWidget(QLabel("调色板:"))
+        self.palette_combo = QComboBox()
+        self.palette_combo.addItems(palettes)
+        if current_palette in palettes:
+            self.palette_combo.setCurrentText(current_palette)
+        palette_layout.addWidget(self.palette_combo)
+        layout.addLayout(palette_layout)
+
+        ratio_layout = QHBoxLayout()
+        ratio_layout.addWidget(QLabel("误差传递:"))
+        self.ratio_spin = QSpinBox()
+        self.ratio_spin.setRange(0, 200)
+        self.ratio_spin.setValue(100)
+        self.ratio_spin.setSuffix(" %")
+        ratio_layout.addWidget(self.ratio_spin)
+        layout.addLayout(ratio_layout)
+
+        self.fpr_widget = QWidget()
+        fpr_layout = QHBoxLayout(self.fpr_widget)
+        fpr_layout.setContentsMargins(0, 0, 0, 0)
+        fpr_layout.addWidget(QLabel("每行帧数:"))
+        self.fpr_spin = QSpinBox()
+        self.fpr_spin.setRange(1, 64)
+        self.fpr_spin.setValue(4)
+        fpr_layout.addWidget(self.fpr_spin)
+        self.fpr_info = QLabel()
+        fpr_layout.addWidget(self.fpr_info)
+        layout.addWidget(self.fpr_widget)
+
+        self.need_split = img_w > 256 or img_h > 256
+        self.fpr_widget.setVisible(self.need_split)
+
+        def _update_fpr_info():
+            fpr = self.fpr_spin.value()
+            tiles = []
+            for strip_y in range(0, img_h, 256):
+                strip_h = min(256, img_h - strip_y)
+                for group_x in range(0, img_w, fpr * 256):
+                    for i in range(fpr):
+                        tile_x = group_x + i * 256
+                        if tile_x >= img_w:
+                            break
+                        tile_w = min(256, img_w - tile_x)
+                        tile_h = strip_h
+                        tiles.append((tile_x, strip_y, tile_w, tile_h))
+            self.fpr_info.setText(f"将生成 {len(tiles)} 帧")
+
+        self.fpr_spin.valueChanged.connect(_update_fpr_info)
+        if self.need_split:
+            _update_fpr_info()
+
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def settings(self) -> tuple[str, float, int]:
+        return (
+            self.palette_combo.currentText(),
+            float(self.ratio_spin.value()),
+            self.fpr_spin.value() if self.need_split else 0,
         )
 
 
@@ -391,6 +582,11 @@ class ImagePanel(QScrollArea):
     def set_image(self, pixmap: QPixmap):
         self._original_pixmap = pixmap
         self._update_zoomed()
+
+    def clear_image(self):
+        self._original_pixmap = None
+        self._image_label.clear()
+        self._image_label.resize(0, 0)
 
     def _update_zoomed(self):
         if self._original_pixmap is None:
@@ -556,6 +752,10 @@ class Dc6Viewer(QMainWindow):
         style = self.style()
         i = QStyle.StandardPixmap
 
+        self.new_act = QAction(style.standardIcon(i.SP_FileIcon), "新建", self)
+        self.new_act.setShortcut(QKeySequence("Ctrl+N"))
+        self.new_act.triggered.connect(self._new_dc6)
+
         self.open_act = QAction(style.standardIcon(i.SP_DialogOpenButton), "打开...", self)
         self.open_act.setShortcut(QKeySequence("Ctrl+O"))
         self.open_act.triggered.connect(self._open_file)
@@ -565,12 +765,24 @@ class Dc6Viewer(QMainWindow):
         self.open_dir_act.triggered.connect(self._open_directory)
         self.open_dir_act.setEnabled(True)
 
-        self.close_act = QAction(style.standardIcon(i.SP_DialogCloseButton), "关闭", self)
-        self.close_act.triggered.connect(self.close)
+        self.save_act = QAction(style.standardIcon(i.SP_DialogSaveButton), "保存", self)
+        self.save_act.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_act.triggered.connect(self._save)
 
         self.save_as_act = QAction(style.standardIcon(i.SP_DialogSaveButton), "另存为...", self)
         self.save_as_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self.save_as_act.triggered.connect(self._save_as)
+
+        self.close_act = QAction(style.standardIcon(i.SP_DialogCloseButton), "关闭", self)
+        self.close_act.triggered.connect(self.close)
+
+        self.delete_act = QAction(style.standardIcon(i.SP_TrashIcon), "删除帧", self)
+        self.delete_act.setShortcut(QKeySequence("Delete"))
+        self.delete_act.triggered.connect(self._delete_frame)
+
+        self.import_act = QAction(style.standardIcon(i.SP_FileDialogStart), "导入...", self)
+        self.import_act.setShortcut(QKeySequence("Ctrl+I"))
+        self.import_act.triggered.connect(self._import_image)
 
         self.export_act = QAction(style.standardIcon(i.SP_DialogSaveButton), "导出 BMP...", self)
         self.export_act.setShortcut(QKeySequence("Ctrl+E"))
@@ -593,11 +805,18 @@ class Dc6Viewer(QMainWindow):
     def _setup_menu(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
+        file_menu.addAction(self.new_act)
+        file_menu.addSeparator()
         file_menu.addAction(self.open_act)
         file_menu.addAction(self.open_dir_act)
+        file_menu.addSeparator()
+        file_menu.addAction(self.save_act)
         file_menu.addAction(self.save_as_act)
         file_menu.addSeparator()
+        file_menu.addAction(self.import_act)
         file_menu.addAction(self.export_act)
+        file_menu.addSeparator()
+        file_menu.addAction(self.delete_act)
         file_menu.addSeparator()
         file_menu.addAction(self.close_act)
 
@@ -610,11 +829,16 @@ class Dc6Viewer(QMainWindow):
         toolbar = self.addToolBar("工具栏")
         toolbar.setIconSize(QSize(24, 24))
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.addAction(self.new_act)
         toolbar.addAction(self.open_act)
         toolbar.addAction(self.open_dir_act)
+        toolbar.addAction(self.save_act)
         toolbar.addAction(self.save_as_act)
         toolbar.addSeparator()
+        toolbar.addAction(self.import_act)
         toolbar.addAction(self.export_act)
+        toolbar.addSeparator()
+        toolbar.addAction(self.delete_act)
         toolbar.addSeparator()
         toolbar.addAction(self.zoom_in_act)
         toolbar.addAction(self.zoom_out_act)
@@ -629,11 +853,125 @@ class Dc6Viewer(QMainWindow):
 
     def _update_actions(self):
         has_file = self._dc6 is not None
-        self.save_as_act.setEnabled(has_file)
-        self.export_act.setEnabled(has_file)
-        self.zoom_in_act.setEnabled(has_file)
-        self.zoom_out_act.setEnabled(has_file)
-        self.zoom_reset_act.setEnabled(has_file)
+        n = self._dc6.total_frames() if has_file else 0
+        self.save_act.setEnabled(has_file and n > 0)
+        self.save_as_act.setEnabled(has_file and n > 0)
+        self.delete_act.setEnabled(has_file and n > 0)
+        self.import_act.setEnabled(has_file)
+        self.export_act.setEnabled(has_file and n > 0)
+        self.zoom_in_act.setEnabled(has_file and n > 0)
+        self.zoom_out_act.setEnabled(has_file and n > 0)
+        self.zoom_reset_act.setEnabled(has_file and n > 0)
+
+    def _new_dc6(self):
+        dc6 = Dc6File.__new__(Dc6File)
+        dc6.version = 6
+        dc6.termination = b"\xee\xee\xee\xee"
+        dc6.frames = []
+        dc6.palette = b""
+        self._dc6 = dc6
+        self._source_path = None
+        self._current_frame = -1
+        self._modified = False
+        self._populate_palettes()
+        self._populate_frame_table()
+        self._populate_thumbnails()
+        self._show_frame(-1)
+        self._update_actions()
+        self.setWindowTitle("DC6 Viewer - 未命名")
+        self.statusBar().showMessage("已创建空白 DC6")
+
+    def _save(self):
+        if not self._dc6:
+            return
+        if not self._dc6.frames:
+            QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先导入帧")
+            return
+        if self._source_path:
+            try:
+                self._write_dc6(self._source_path)
+                self._modified = False
+                name = Path(self._source_path).name
+                self.setWindowTitle(f"DC6 Viewer - {name}")
+                self.statusBar().showMessage(f"已保存: {self._source_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "保存失败", str(e))
+        else:
+            self._save_as()
+
+    def _delete_frame(self):
+        if not self._dc6 or self._dc6.total_frames() <= 0:
+            return
+        idx = self._current_frame
+        del self._dc6.frames[idx]
+        self._modified = True
+        if self._dc6.total_frames() == 0:
+            self._current_frame = -1
+            self._show_frame(-1)
+        else:
+            if self._current_frame >= self._dc6.total_frames():
+                self._current_frame = self._dc6.total_frames() - 1
+            self._show_frame(self._current_frame)
+        self._populate_frame_table()
+        self._populate_thumbnails()
+        self._update_actions()
+        self.statusBar().showMessage(f"已删除帧 {idx}")
+
+    def _import_image(self):
+        if not self._dc6:
+            return
+        last_dir = self._settings.value("last_import_dir", "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择导入图片", last_dir,
+            "图片文件 (*.png *.bmp *.jpg *.jpeg *.gif *.tga);;所有文件 (*)",
+        )
+        if not path:
+            return
+        self._settings.setValue("last_import_dir", str(Path(path).parent))
+
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.critical(self, "导入失败", "无法加载图片")
+            return
+
+        palettes = list_palettes()
+        current_pal = self.palette_combo.currentText()
+        dlg = ImportDialog(path, (img.width(), img.height()), palettes, current_pal, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        pal_name, ratio, fpr = dlg.settings()
+
+        try:
+            palette_data = load_palette(pal_name)
+        except Exception as e:
+            QMessageBox.critical(self, "调色板错误", str(e))
+            return
+
+        dithered = floyd_steinberg_dither(img, palette_data, ratio)
+
+        if fpr > 0:
+            tiles = split_image_tiles(dithered, fpr)
+        else:
+            tiles = [(0, 0, dithered.width(), dithered.height(), dithered)]
+        insert_pos = max(0, self._current_frame)
+        new_frames = []
+        for _tx, _ty, tw, th, tile_img in tiles:
+            pixels = bytearray(tw * th)
+            for y in range(th):
+                scan = tile_img.constScanLine(y)
+                pixels[y * tw : (y + 1) * tw] = scan[:tw]
+            new_frames.append(FrameInfo(width=tw, height=th, pixels=pixels))
+
+        for i, frame in enumerate(new_frames):
+            self._dc6.frames.insert(insert_pos + i, frame)
+
+        self._modified = True
+        self._populate_frame_table()
+        self._populate_thumbnails()
+        self._show_frame(self._current_frame)
+        self._update_actions()
+        self.statusBar().showMessage(f"已导入 {len(new_frames)} 帧")
 
     def load_data(self, data: bytes, source_path: str | None = None):
         try:
@@ -681,7 +1019,7 @@ class Dc6Viewer(QMainWindow):
     def _populate_thumbnails(self):
         scroll_pos = self.thumb_bar.horizontalScrollBar().value()
         self.thumb_bar.clear_thumbs()
-        if not self._dc6:
+        if not self._dc6 or not self._dc6.frames:
             return
         max_w = max(f.width for f in self._dc6.frames) or 1
         max_h = max(f.height for f in self._dc6.frames) or 1
@@ -735,6 +1073,7 @@ class Dc6Viewer(QMainWindow):
 
     def _show_frame(self, index: int):
         if not self._dc6 or index < 0 or index >= self._dc6.total_frames():
+            self.image_panel.clear_image()
             return
         img = self._dc6.get_rgba_image(index)
         pix = QPixmap.fromImage(img)
@@ -790,12 +1129,19 @@ class Dc6Viewer(QMainWindow):
     def _save_as(self):
         if not self._dc6:
             return
+        if not self._dc6.frames:
+            QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先导入帧")
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "另存为 DC6", "", "DC6 文件 (*.dc6);;所有文件 (*)"
         )
         if path:
             try:
                 self._write_dc6(path)
+                self._source_path = path
+                self._modified = False
+                name = Path(path).name
+                self.setWindowTitle(f"DC6 Viewer - {name}")
                 self.statusBar().showMessage(f"已保存: {path}")
             except Exception as e:
                 QMessageBox.critical(self, "保存失败", str(e))
@@ -839,6 +1185,60 @@ class Dc6Viewer(QMainWindow):
         with Path(path).open("wb") as f:
             f.write(buf.getvalue())
 
+    def _build_grid_image(self, base_frame: int, count: int, cols: int, rows: int) -> QImage | None:
+        rows = (count + cols - 1) // cols
+        total_w = 0
+        total_h = 0
+        row_heights: list[int] = []
+        for i in range(rows):
+            row_width = 0
+            max_row_height = 0
+            for j in range(cols):
+                index = i * cols + j
+                if index >= count:
+                    break
+                frame_index = base_frame + index
+                f = self._dc6.frames[frame_index]
+                row_width += f.width
+                if f.height > max_row_height:
+                    max_row_height = f.height
+            if row_width > total_w:
+                total_w = row_width
+            row_heights.append(max_row_height)
+        total_h = sum(row_heights)
+        if total_w == 0 or total_h == 0:
+            return None
+
+        composite = QImage(total_w, total_h, QImage.Format.Format_Indexed8)
+        composite.setColorCount(256)
+        for i in range(256):
+            if i * 3 + 2 < len(self._dc6.palette):
+                b = self._dc6.palette[i * 3]
+                g = self._dc6.palette[i * 3 + 1]
+                r = self._dc6.palette[i * 3 + 2]
+            else:
+                r = g = b = 0
+            composite.setColor(i, QColor(r, g, b).rgb())
+        composite.fill(0)
+
+        fy = 0
+        for i in range(rows):
+            fx = 0
+            max_row_height = 0
+            for j in range(cols):
+                index = i * cols + j
+                if index >= count:
+                    break
+                frame_index = base_frame + index
+                f = self._dc6.frames[frame_index]
+                for y in range(f.height):
+                    for x in range(f.width):
+                        val = f.pixels[y * f.width + x]
+                        composite.setPixel(fx + x, fy + y, val)
+                fx += f.width
+            fy += row_heights[i]
+        return composite
+
     def _export_bmp(self):
         if not self._dc6:
             return
@@ -847,9 +1247,7 @@ class Dc6Viewer(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        start_frame, count, cols, rows, base_name = dlg.settings()
-        frames_per_image = cols * rows
-        num_images = (count + frames_per_image - 1) // frames_per_image
+        start_frame, count, cols, rows, merge_mode, base_name = dlg.settings()
 
         last_export = self._settings.value("last_export_dir", "")
         dest_dir = QFileDialog.getExistingDirectory(self, "选择导出目录", last_export)
@@ -857,30 +1255,28 @@ class Dc6Viewer(QMainWindow):
             return
         self._settings.setValue("last_export_dir", dest_dir)
 
-        exported = []
+        frames_per_image = cols * rows
+        num_images = (count + frames_per_image - 1) // frames_per_image
+
+        grid_images: list[QImage] = []
         for img_idx in range(num_images):
             base_frame = start_frame + img_idx * frames_per_image
             actual_frames = min(frames_per_image, count - img_idx * frames_per_image)
-
             if actual_frames <= 0:
                 break
+            grid = self._build_grid_image(base_frame, actual_frames, cols, rows)
+            if grid is not None:
+                grid_images.append(grid)
 
-            total_w = cols * max(
-                (
-                    self._dc6.frames[base_frame + f].width
-                    if base_frame + f < len(self._dc6.frames)
-                    else 0
-                )
-                for f in range(actual_frames)
-            )
-            total_h = rows * max(
-                self._dc6.frames[base_frame + f].height for f in range(actual_frames)
-            )
-            if total_w == 0 or total_h == 0:
-                continue
+        if not grid_images:
+            return
 
-            composite = QImage(total_w, total_h, QImage.Format.Format_Indexed8)
-            composite.setColorCount(256)
+        if merge_mode:
+            total_w = sum(img.width() for img in grid_images)
+            total_h = max(img.height() for img in grid_images)
+
+            merged = QImage(total_w, total_h, QImage.Format.Format_Indexed8)
+            merged.setColorCount(256)
             for i in range(256):
                 if i * 3 + 2 < len(self._dc6.palette):
                     b = self._dc6.palette[i * 3]
@@ -888,31 +1284,32 @@ class Dc6Viewer(QMainWindow):
                     r = self._dc6.palette[i * 3 + 2]
                 else:
                     r = g = b = 0
-                composite.setColor(i, QColor(r, g, b).rgb())
-            composite.fill(0)
+                merged.setColor(i, QColor(r, g, b).rgb())
 
-            for f in range(actual_frames):
-                fi = base_frame + f
-                if fi >= len(self._dc6.frames):
-                    break
-                frame = self._dc6.frames[fi]
-                fx = (f % cols) * frame.width
-                fy = (f // cols) * frame.height
-                for y in range(frame.height):
-                    for x in range(frame.width):
-                        val = frame.pixels[y * frame.width + x]
-                        composite.setPixel(fx + x, fy + y, val)
+            x_offset = 0
+            for grid in grid_images:
+                for y in range(grid.height()):
+                    for x in range(grid.width()):
+                        merged.setPixel(x_offset + x, y, grid.pixelIndex(x, y))
+                x_offset += grid.width()
 
-            if num_images == 1:
-                bmp_name = f"{base_name}.bmp"
-            else:
-                bmp_name = f"{base_name}-{img_idx:02d}.bmp"
-            bmp_path = str(Path(dest_dir) / bmp_name)
-            composite.save(bmp_path)
-            exported.append(bmp_path)
+            bmp_path = str(Path(dest_dir) / f"{base_name}.bmp")
+            merged.save(bmp_path)
+            self.statusBar().showMessage(f"已导出 1 个合并文件")
+            QMessageBox.information(self, "导出完成", f"已导出 1 个合并 BMP 文件: {base_name}.bmp")
+        else:
+            exported = []
+            for img_idx, grid in enumerate(grid_images):
+                if num_images == 1:
+                    bmp_name = f"{base_name}.bmp"
+                else:
+                    bmp_name = f"{base_name}-{img_idx:02d}.bmp"
+                bmp_path = str(Path(dest_dir) / bmp_name)
+                grid.save(bmp_path)
+                exported.append(bmp_path)
 
-        self.statusBar().showMessage(f"已导出 {len(exported)} 个文件")
-        QMessageBox.information(self, "导出完成", f"已导出 {len(exported)} 个 BMP 文件")
+            self.statusBar().showMessage(f"已导出 {len(exported)} 个文件")
+            QMessageBox.information(self, "导出完成", f"已导出 {len(exported)} 个 BMP 文件")
 
     @staticmethod
     def _make_zoom_icon(text: str, size: int = 24) -> QIcon:
