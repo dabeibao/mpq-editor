@@ -139,6 +139,19 @@ def _stormlib_dll() -> str:
     return ""
 
 
+def _copy_listfiles(out_dir: Path):
+    """把仓库根目录的 Listfiles 复制到程序目录，供 MPQ 编辑器启动时扫描。"""
+    src = ROOT / "Listfiles"
+    if not src.is_dir():
+        print("Warning: Listfiles directory not found, skipping.")
+        return
+    dst = out_dir / "Listfiles"
+    if dst.exists():
+        _rmtree_force(dst)
+    shutil.copytree(src, dst)
+    print(f"Listfiles copied to: {dst}")
+
+
 def _build_mpq_editor():
     name = "MPQEditor"
     print(f"Building {name}...")
@@ -166,6 +179,7 @@ def _build_mpq_editor():
     out_dir = DIST / name
     if out_dir.exists():
         _cleanup(out_dir)
+        _copy_listfiles(out_dir)
         print(f"\nPackage ready: {out_dir}")
 
 
@@ -223,6 +237,14 @@ def _merge_internal(built: list[str]):
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     if not dst.exists():
                         shutil.copy2(item, dst)
+
+        # MPQ 编辑器的 Listfiles 提升到程序目录（与 exe 同级）
+        app_listfiles = app_dir / "Listfiles"
+        if app_listfiles.is_dir():
+            dst_listfiles = DIST / "Listfiles"
+            if dst_listfiles.exists():
+                _rmtree_force(dst_listfiles)
+            shutil.copytree(app_listfiles, dst_listfiles)
 
         exe_src = app_dir / f"{name}.exe"
         if exe_src.exists():

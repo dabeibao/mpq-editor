@@ -11,9 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from PySide6.QtGui import QColor, QImage
 
-from dc6.dc6_viewer import (  # noqa: E402
+from dc6.dc6_viewer import (
     Dc6File,
     FrameInfo,
+    build_dc6_bytes,
     compress_frame,
     floyd_steinberg_dither,
     list_palettes,
@@ -22,14 +23,22 @@ from dc6.dc6_viewer import (  # noqa: E402
 )
 
 
-def make_simple_dc6(width: int, height: int, pixels: bytes | None = None) -> bytes:
+def make_simple_dc6(
+    width: int,
+    height: int,
+    pixels: bytes | None = None,
+    x_offset: int = 0,
+    y_offset: int = 0,
+) -> bytes:
     """Build a minimal valid DC6 file with 1 frame."""
     if pixels is None:
         pixels = bytes([0] * width * height)
 
     compressed = compress_frame(pixels, width, height)
-    header = struct.pack("<IIIIIIII", 0, width, height, 0, 0, 0, 0, 0)
-    block_data = header + compressed + b"\xee\xee\xee"
+    # Block header: flags, width, height, nXOffset, nYOffset, unk, next, length
+    header = bytearray(struct.pack("<IIIiiIII", 0, width, height, x_offset, y_offset, 0, 0, 0))
+    struct.pack_into("<I", header, 28, len(compressed))
+    block_data = bytes(header) + compressed + b"\xee\xee\xee"
 
     buf = io.BytesIO()
     buf.write(struct.pack("<III", 6, 1, 0))
@@ -57,7 +66,7 @@ class TestDc6File:
             Dc6File(bytes(data))
 
     def test_parse_empty_data(self):
-        with pytest.raises(Exception):
+        with pytest.raises(struct.error):
             Dc6File(b"")
 
     def test_parse_invalid_blockcount(self):
@@ -132,41 +141,75 @@ class TestDc6FileRoundtrip:
         original = make_simple_dc6(w, h)
         dc6 = Dc6File(original)
 
-        out = io.BytesIO()
-        out.write(struct.pack("<III", dc6.version, 1, 0))
-        out.write(dc6.termination[:4].ljust(4, b"\xee"))
-        out.write(struct.pack("<II", 1, dc6.total_frames()))
-
-        pointer_table_offset = out.tell()
-        for _ in range(dc6.total_frames()):
-            out.write(struct.pack("<I", 0))
-
-        pointers: list[int] = []
-        for i in range(dc6.total_frames()):
-            pointers.append(out.tell())
-            frame = dc6.frames[i]
-            block_start = out.tell()
-            out.write(struct.pack("<IIIIIIII", 0, frame.width, frame.height, 0, 0, 0, 0, 0))
-            data_start = out.tell()
-            compressed = compress_frame(bytes(frame.pixels), frame.width, frame.height)
-            out.write(compressed)
-            data_end = out.tell()
-            out.write(b"\xee\xee\xee")
-            block_end = out.tell()
-            out.seek(block_start + 24)
-            out.write(struct.pack("<II", block_end, data_end - data_start))
-            out.seek(block_end)
-
-        out.seek(pointer_table_offset)
-        for p in pointers:
-            out.write(struct.pack("<I", p))
-
-        written = out.getvalue()
+        written = build_dc6_bytes(dc6)
         dc6_2 = Dc6File(written)
         assert dc6_2.total_frames() == 1
         assert dc6_2.frames[0].width == w
         assert dc6_2.frames[0].height == h
         assert dc6_2.version == 6
+
+
+class TestFrameOffsets:
+    def test_parse_positive_offsets(self):
+        data = make_simple_dc6(8, 8, x_offset=5, y_offset=23)
+        dc6 = Dc6File(data)
+        assert dc6.frames[0].x_offset == 5
+        assert dc6.frames[0].y_offset == 23
+
+    def test_parse_negative_offsets(self):
+        # Offsets are signed 32-bit on disk (real data: grasp cursor x=-2, y=24)
+        data = make_simple_dc6(8, 8, x_offset=-2, y_offset=24)
+        dc6 = Dc6File(data)
+        assert dc6.frames[0].x_offset == -2
+        assert dc6.frames[0].y_offset == 24
+
+    def test_parse_zero_offsets(self):
+        data = make_simple_dc6(8, 8)
+        dc6 = Dc6File(data)
+        assert dc6.frames[0].x_offset == 0
+        assert dc6.frames[0].y_offset == 0
+
+    def test_offsets_preserved_on_roundtrip(self):
+        f1 = FrameInfo(width=8, height=8, pixels=bytearray(64), x_offset=10, y_offset=-7)
+        f2 = FrameInfo(width=4, height=4, pixels=bytearray(16), x_offset=0, y_offset=24)
+        dc6 = Dc6File.__new__(Dc6File)
+        dc6.version = 6
+        dc6.termination = b"\xee\xee\xee\xee"
+        dc6.frames = [f1, f2]
+        dc6.palette = b""
+
+        dc6_2 = Dc6File(build_dc6_bytes(dc6))
+        assert dc6_2.total_frames() == 2
+        assert dc6_2.frames[0].x_offset == 10
+        assert dc6_2.frames[0].y_offset == -7
+        assert dc6_2.frames[1].x_offset == 0
+        assert dc6_2.frames[1].y_offset == 24
+        # pixel payload must survive the roundtrip too
+        assert bytes(dc6_2.frames[0].pixels) == bytes(f1.pixels)
+        assert bytes(dc6_2.frames[1].pixels) == bytes(f2.pixels)
+
+    def test_real_file_header_layout(self):
+        # Mirror the layout of D2CMP.dll's D2GfxCellStrc block header:
+        # 0x00 flags, 0x04 width, 0x08 height, 0x0C nXOffset, 0x10 nYOffset
+        w, h = 4, 2
+        compressed = compress_frame(bytes([0] * (w * h)), w, h)
+        header = bytearray(32)
+        struct.pack_into("<I", header, 0x04, w)
+        struct.pack_into("<I", header, 0x08, h)
+        struct.pack_into("<i", header, 0x0C, 1)
+        struct.pack_into("<i", header, 0x10, -15)
+        struct.pack_into("<I", header, 0x1C, len(compressed))
+        buf = io.BytesIO()
+        buf.write(struct.pack("<III", 6, 1, 0))
+        buf.write(b"\xee\xee\xee\xee")
+        buf.write(struct.pack("<II", 1, 1))
+        buf.write(struct.pack("<I", 24 + 4))  # pointer table at 0x18, block after it
+        buf.write(bytes(header))
+        buf.write(compressed)
+        buf.write(b"\xee\xee\xee")
+        dc6 = Dc6File(buf.getvalue())
+        assert dc6.frames[0].x_offset == 1
+        assert dc6.frames[0].y_offset == -15
 
 
 class TestPalette:

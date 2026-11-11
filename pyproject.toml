@@ -7,6 +7,9 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "PTH", "RUF", "ASYNC
 ignore = [
        "E501",
        "RUF001",
+       # 中文文档字符串 / 注释里的全角标点不是歧义字符，与 RUF001 保持一致。
+       "RUF002",
+       "RUF003",
        "N806",
        "PTH110",
        "PTH108",
@@ -19,6 +22,8 @@ ignore = [
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
+# 本机 PATH 里的 python 不是装了 PySide6 的解释器，补上其 site-packages，避免 LSP 误报 missing imports。
+extraPaths = ["D:/tools/WPy64-31320/python/Lib/site-packages"]
 
 reportPossiblyUnboundVariable = "error"
 reportAttributeAccessIssue = "error"

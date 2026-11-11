@@ -1,12 +1,33 @@
+"""DC6 Viewer 界面层。
+
+数据模型与图像处理在 ``dc6.model``，帧编辑操作在 ``dc6.frame_ops``；
+本文件只负责窗口、菜单、对话框与用户交互。为兼容历史调用，
+这里仍然再导出模型层的公开符号。
+"""
+
 from __future__ import annotations
 
-import io
-import struct
-from dataclasses import dataclass, field
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import override
 
-from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QTimer
+# 兼容直接执行 `python dc6/dc6_viewer.py` 的情况。
+if not __package__:  # pragma: no cover - 仅脚本直跑时生效
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from PySide6.QtCore import (
+    QAbstractItemModel,
+    QEvent,
+    QModelIndex,
+    QObject,
+    QPersistentModelIndex,
+    QPoint,
+    QSettings,
+    QSize,
+    Qt,
+    QTimer,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -15,17 +36,22 @@ from PySide6.QtGui import (
     QIcon,
     QImage,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QPalette,
     QPen,
     QPixmap,
+    QResizeEvent,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -34,6 +60,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -41,354 +68,173 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-DC6_SIGNATURE = 6
-PAL_DIR = Path(__file__).parent / "pal"
+from dc6.frame_ops import (
+    FrameIndexError,
+    FrameSizeError,
+    delete_frame,
+    export_frame,
+    frame_export_name,
+    frames_from_image,
+    insert_frames,
+    replace_frame,
+    set_frame_offset,
+    validate_frame_size,
+    validate_offset,
+)
+from dc6.model import (
+    DC6_SIGNATURE,
+    MAX_FRAME_SIZE,
+    OFFSET_MAX,
+    OFFSET_MIN,
+    PAL_DIR,
+    Dc6File,
+    FrameInfo,
+    build_dc6_bytes,
+    compress_frame,
+    floyd_steinberg_dither,
+    list_palettes,
+    load_palette,
+    make_bmp_data,
+    nearest_palette_index,
+    palette_rgb,
+    plan_tiles,
+    split_image_tiles,
+)
 
-
-@dataclass
-class FrameInfo:
-    width: int
-    height: int
-    x_offset: int = 0
-    y_offset: int = 0
-    pixels: bytearray = field(default_factory=bytearray)
-
-
-class Dc6File:
-    def __init__(self, data: bytes):
-        self.version: int = 0
-        self.termination: bytes = b""
-        self.frames: list[FrameInfo] = []
-        self.palette: bytes = b""
-        self._parse(data)
-
-    def _parse(self, data: bytes):
-        (
-            self.version,
-            unknown01,
-            unknown02,
-        ) = struct.unpack_from("<III", data, 0)
-        if self.version != DC6_SIGNATURE:
-            raise ValueError(f"Not a DC6 file (version={self.version})")
-
-        term = struct.unpack_from("4B", data, 12)
-        self.termination = bytes(term)
-
-        (unknown03, blockcount) = struct.unpack_from("<II", data, 16)
-
-        if blockcount < 1 or blockcount > 1024:
-            raise ValueError(f"Invalid block count: {blockcount}")
-
-        pointers = struct.unpack_from(f"<{blockcount}I", data, 24)
-
-        self.frames = []
-        for i in range(blockcount):
-            offset = pointers[i]
-            (
-                bh_unknown01,
-                width,
-                height,
-                bh_unknown02,
-                bh_unknown03,
-                bh_unknown04,
-                next_block,
-                length,
-            ) = struct.unpack_from("<IIIIIIII", data, offset)
-            raw = data[offset + 32 : offset + 32 + length]
-            pixels = self._decompress(raw, width, height)
-            self.frames.append(FrameInfo(width=width, height=height, pixels=pixels))
-
-    @staticmethod
-    def _decompress(data: bytes, width: int, height: int) -> bytearray:
-        result = bytearray(width * height)
-        in_pos = 0
-        row = height - 1
-        col = 0
-
-        while in_pos < len(data) and row >= 0:
-            c1 = data[in_pos]
-            in_pos += 1
-            if c1 == 0x80:
-                if col < width:
-                    pass
-                row -= 1
-                col = 0
-            elif c1 > 0x80:
-                skip = c1 - 0x80
-                col += skip
-            else:
-                for _ in range(c1):
-                    if col < width and row >= 0:
-                        result[row * width + col] = data[in_pos]
-                        in_pos += 1
-                        col += 1
-                    else:
-                        in_pos += 1
-
-        return result
-
-    def get_rgba_image(self, frame_index: int) -> QImage:
-        frame = self.frames[frame_index]
-        w, h = frame.width, frame.height
-        img = QImage(w, h, QImage.Format.Format_Indexed8)
-        img.setColorCount(256)
-        for i in range(256):
-            if i * 3 + 2 < len(self.palette):
-                b = self.palette[i * 3]
-                g = self.palette[i * 3 + 1]
-                r = self.palette[i * 3 + 2]
-            else:
-                r = g = b = 0
-            img.setColor(i, QColor(r, g, b).rgb())
-        for y in range(h):
-            for x in range(w):
-                val = frame.pixels[y * w + x]
-                img.setPixel(x, y, val)
-        return img
-
-    def total_frames(self) -> int:
-        return len(self.frames)
-
-
-def compress_frame(pixels: bytes | bytearray, width: int, height: int) -> bytes:
-    buf = io.BytesIO()
-    transcol = 0
-
-    for line in range(height - 1, -1, -1):
-        col = 0
-        row_data = pixels[line * width : (line + 1) * width]
-        while col < width:
-            run_start = col
-            while col < width and row_data[col] == transcol:
-                col += 1
-            skip = col - run_start
-            if skip:
-                while skip > 0x7F:
-                    buf.write(bytes([0xFF]))
-                    skip -= 0x7F
-                if skip:
-                    buf.write(bytes([0x80 | skip]))
-
-            if col >= width:
-                break
-
-            run_start = col
-            while col < width and row_data[col] != transcol:
-                col += 1
-            literal = row_data[run_start:col]
-            while literal:
-                chunk = literal[:0x7F]
-                buf.write(bytes([len(chunk)]))
-                buf.write(chunk)
-                literal = literal[0x7F:]
-
-        buf.write(b"\x80")
-
-    return buf.getvalue()
-
-
-def load_palette(name_or_path: str) -> bytes:
-    p = Path(name_or_path)
-    if not p.is_file():
-        p = PAL_DIR / f"{name_or_path}.pal"
-    if not p.is_file():
-        p = PAL_DIR / name_or_path
-    if not p.is_file():
-        raise FileNotFoundError(f"Cannot find palette: {name_or_path}")
-    data = p.read_bytes()
-    if len(data) != 768:
-        raise ValueError(f"Invalid palette file size: {len(data)} (expected 768)")
-    return data
-
-
-def list_palettes() -> list[str]:
-    if not PAL_DIR.is_dir():
-        return []
-    return sorted(f.stem for f in PAL_DIR.iterdir() if f.suffix.lower() == ".pal")
-
-
-def make_bmp_data(frame: FrameInfo, palette: bytes) -> bytes:
-    w, h = frame.width, frame.height
-    row_size = ((w * 8 + 31) // 32) * 4
-
-    bmp_header = bytearray(14 + 40 + row_size * h)
-    file_size = 14 + 40 + row_size * h
-
-    struct.pack_into("<2sI4xI", bmp_header, 0, b"BM", file_size, 14 + 40)
-    struct.pack_into("<IiiHHIIiiII", bmp_header, 14, 40, w, h, 1, 8, 0, row_size * h, 0, 0, 256, 0)
-
-    for i in range(256):
-        off = 14 + 40 + i * 4
-        if i * 3 + 2 < len(palette):
-            bmp_header[off] = palette[i * 3]
-            bmp_header[off + 1] = palette[i * 3 + 1]
-            bmp_header[off + 2] = palette[i * 3 + 2]
-        bmp_header[off + 3] = 0
-
-    pixel_start = 14 + 40 + 256 * 4
-    for y in range(h):
-        dst = pixel_start + (h - 1 - y) * row_size
-        src_start = y * w
-        for x in range(w):
-            bmp_header[dst + x] = frame.pixels[src_start + x]
-
-    return bytes(bmp_header)
-
-
-def floyd_steinberg_dither(img: QImage, palette: bytes, ratio: float) -> QImage:
-    w, h = img.width(), img.height()
-    ratio = max(0.0, min(2.0, ratio / 100.0))
-
-    pal_colors = [(0, 0, 0)] * 256
-    for i in range(256):
-        if i * 3 + 2 < len(palette):
-            b = palette[i * 3]
-            g = palette[i * 3 + 1]
-            r = palette[i * 3 + 2]
-            pal_colors[i] = (r, g, b)
-
-    img_rgba = img.convertToFormat(QImage.Format.Format_ARGB32)
-
-    err_cur = [[0.0, 0.0, 0.0] for _ in range(w + 1)]
-    err_next = [[0.0, 0.0, 0.0] for _ in range(w + 1)]
-
-    out = QImage(w, h, QImage.Format.Format_Indexed8)
-    out.setColorCount(256)
-    for i, (r, g, b) in enumerate(pal_colors):
-        out.setColor(i, QColor(r, g, b).rgb())
-
-    for y in range(h):
-        for x in range(w):
-            pixel = img_rgba.pixel(x, y)
-            orig_r = (pixel >> 16) & 0xFF
-            orig_g = (pixel >> 8) & 0xFF
-            orig_b = pixel & 0xFF
-
-            r = orig_r + err_cur[x][0]
-            g = orig_g + err_cur[x][1]
-            b = orig_b + err_cur[x][2]
-
-            r = max(0, min(255, int(r + 0.5)))
-            g = max(0, min(255, int(g + 0.5)))
-            b = max(0, min(255, int(b + 0.5)))
-
-            best_idx = 0
-            best_dist = 3 * 256 * 256
-            for i, (pr, pg, pb) in enumerate(pal_colors):
-                dr = r - pr
-                dg = g - pg
-                db = b - pb
-                dist = dr * dr + dg * dg + db * db
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = i
-
-            out.setPixel(x, y, best_idx)
-
-            qr = (r - pal_colors[best_idx][0]) * ratio
-            qg = (g - pal_colors[best_idx][1]) * ratio
-            qb = (b - pal_colors[best_idx][2]) * ratio
-
-            if x + 1 < w:
-                err_cur[x + 1][0] += qr * 7.0 / 16.0
-                err_cur[x + 1][1] += qg * 7.0 / 16.0
-                err_cur[x + 1][2] += qb * 7.0 / 16.0
-
-            if x > 0 and y + 1 < h:
-                err_next[x - 1][0] += qr * 3.0 / 16.0
-                err_next[x - 1][1] += qg * 3.0 / 16.0
-                err_next[x - 1][2] += qb * 3.0 / 16.0
-
-            if y + 1 < h:
-                err_next[x][0] += qr * 5.0 / 16.0
-                err_next[x][1] += qg * 5.0 / 16.0
-                err_next[x][2] += qb * 5.0 / 16.0
-
-            if x + 1 < w and y + 1 < h:
-                err_next[x + 1][0] += qr * 1.0 / 16.0
-                err_next[x + 1][1] += qg * 1.0 / 16.0
-                err_next[x + 1][2] += qb * 1.0 / 16.0
-
-        err_cur, err_next = err_next, [[0.0, 0.0, 0.0] for _ in range(w + 1)]
-
-    return out
-
-
-def split_image_tiles(img: QImage, frames_per_row: int) -> list[tuple[int, int, int, int, QImage]]:
-    img_w, img_h = img.width(), img.height()
-    tiles: list[tuple[int, int, int, int, QImage]] = []
-    group_width = frames_per_row * 256
-
-    for group_x in range(0, img_w, group_width):
-        for strip_y in range(0, img_h, 256):
-            strip_h = min(256, img_h - strip_y)
-            for i in range(frames_per_row):
-                tile_x = group_x + i * 256
-                if tile_x >= img_w:
-                    break
-                tile_w = min(256, img_w - tile_x)
-                tile_h = strip_h
-                sub = img.copy(tile_x, strip_y, tile_w, tile_h)
-                tiles.append((tile_x, strip_y, tile_w, tile_h, sub))
-
-    return tiles
-
+# 历史版本的数据模型 / 算法都定义在本文件，这里保留同名再导出以免破坏既有调用。
+__all__ = [
+    "DC6_SIGNATURE",
+    "MAX_FRAME_SIZE",
+    "OFFSET_MAX",
+    "OFFSET_MIN",
+    "PAL_DIR",
+    "Dc6File",
+    "Dc6PreviewPanel",
+    "Dc6Viewer",
+    "ExportDialog",
+    "FrameIndexError",
+    "FrameInfo",
+    "FrameSizeError",
+    "ImagePanel",
+    "ImportDialog",
+    "OffsetDelegate",
+    "OffsetDialog",
+    "ThumbnailBar",
+    "build_dc6_bytes",
+    "compress_frame",
+    "delete_frame",
+    "export_frame",
+    "floyd_steinberg_dither",
+    "frame_export_name",
+    "frames_from_image",
+    "insert_frames",
+    "list_palettes",
+    "load_palette",
+    "main",
+    "make_bmp_data",
+    "nearest_palette_index",
+    "palette_rgb",
+    "plan_tiles",
+    "replace_frame",
+    "set_frame_offset",
+    "show_dc6_window",
+    "split_image_tiles",
+    "validate_frame_size",
+    "validate_offset",
+]
 
 THUMB_HEIGHT = 40
 THUMB_WIDTH = 60
 
 
-class ThumbnailBar(QScrollArea):
-    def __init__(self, parent: QWidget | None = None):
+class OffsetDelegate(QStyledItemDelegate):
+    """X / Y 偏移列的编辑器：只能输入有符号 32 位整数。"""
+
+    @override
+    def createEditor(
+        self,
+        parent: QWidget,
+        option: QStyleOptionViewItem,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> QWidget:
+        editor = QSpinBox(parent)
+        editor.setRange(OFFSET_MIN, OFFSET_MAX)
+        editor.setSingleStep(1)
+        editor.setFrame(False)
+        return editor
+
+    @override
+    def setEditorData(self, editor: QWidget, index: QModelIndex | QPersistentModelIndex) -> None:
+        if not isinstance(editor, QSpinBox):
+            return
+        try:
+            value = int(index.data(Qt.ItemDataRole.EditRole))
+        except (TypeError, ValueError):
+            value = 0
+        editor.setValue(max(OFFSET_MIN, min(OFFSET_MAX, value)))
+
+    @override
+    def setModelData(
+        self,
+        editor: QWidget,
+        model: QAbstractItemModel,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> None:
+        if isinstance(editor, QSpinBox):
+            editor.interpretText()
+            model.setData(index, editor.value(), Qt.ItemDataRole.EditRole)
+
+
+class _ThumbWidget(QWidget):
+    """单个缩略图：左键选中，右键弹出帧菜单。"""
+
+    _index: int
+    _on_click: Callable[[int], None]
+    _on_context: Callable[[int, QPoint], None]
+
+    def __init__(
+        self,
+        index: int,
+        pixmap: QPixmap,
+        scale: float,
+        selected: bool,
+        on_click: Callable[[int], None],
+        on_context: Callable[[int, QPoint], None],
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
-        self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setFixedHeight(THUMB_HEIGHT + 34)
+        self._index = index
+        self._on_click = on_click
+        self._on_context = on_context
+        self.setFixedSize(THUMB_WIDTH + 8, THUMB_HEIGHT + 22)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._context_requested)
 
-        self._container = QWidget()
-        self._layout = QHBoxLayout(self._container)
-        self._layout.setContentsMargins(4, 2, 4, 2)
-        self._layout.setSpacing(6)
-        self._layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
-        self.setWidget(self._container)
-
-    def clear_thumbs(self):
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
-
-    def add_thumb(self, pixmap: QPixmap, index: int, scale: float, selected: bool = False):
-        pw = int(pixmap.width() * scale)
-        ph = int(pixmap.height() * scale)
-        container = QWidget()
-        container.setFixedSize(THUMB_WIDTH + 8, THUMB_HEIGHT + 22)
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(1)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         img_label = QLabel()
         scaled = pixmap.scaled(
-            pw,
-            ph,
+            int(pixmap.width() * scale),
+            int(pixmap.height() * scale),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
         img_label.setPixmap(scaled)
         img_label.setFixedSize(THUMB_WIDTH, THUMB_HEIGHT)
         img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if selected:
-            img_label.setStyleSheet("border: 2px solid #409EFF;")
-        else:
-            img_label.setStyleSheet("border: 1px solid #ccc;")
+        img_label.setStyleSheet("border: 2px solid #409EFF;" if selected else "border: 1px solid #ccc;")
 
         idx_label = QLabel(str(index))
         idx_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -398,17 +244,81 @@ class ThumbnailBar(QScrollArea):
         layout.addWidget(img_label, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(idx_label, 0, Qt.AlignmentFlag.AlignCenter)
 
-        container.mousePressEvent = lambda _e, idx=index: self._on_thumb_clicked(idx)
-        self._layout.addWidget(container)
+    @override
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._on_click(self._index)
+        super().mousePressEvent(event)
 
-    thumb_clicked = None
+    def _context_requested(self, pos: QPoint) -> None:
+        self._on_context(self._index, self.mapToGlobal(pos))
 
-    def _on_thumb_clicked(self, index: int):
-        if self.thumb_clicked:
+
+class ThumbnailBar(QScrollArea):
+    _container: QWidget
+    _layout: QHBoxLayout
+    thumb_clicked: Callable[[int], None] | None
+    context_menu_requested: Callable[[int | None, QPoint], None] | None
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFixedHeight(THUMB_HEIGHT + 34)
+
+        self._container = QWidget()
+        self._container.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._container.customContextMenuRequested.connect(self._container_context_requested)
+        self._layout = QHBoxLayout(self._container)
+        self._layout.setContentsMargins(4, 2, 4, 2)
+        self._layout.setSpacing(6)
+        self._layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
+        self.setWidget(self._container)
+
+        self.thumb_clicked = None
+        self.context_menu_requested = None
+
+    def clear_thumbs(self):
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+
+    def add_thumb(self, pixmap: QPixmap, index: int, scale: float, selected: bool = False):
+        widget = _ThumbWidget(
+            index,
+            pixmap,
+            scale,
+            selected,
+            self._on_thumb_clicked,
+            self._on_thumb_context,
+        )
+        self._layout.addWidget(widget)
+
+    def _on_thumb_clicked(self, index: int) -> None:
+        if self.thumb_clicked is not None:
             self.thumb_clicked(index)
+
+    def _on_thumb_context(self, index: int, global_pos: QPoint) -> None:
+        if self.context_menu_requested is not None:
+            self.context_menu_requested(index, global_pos)
+
+    def _container_context_requested(self, pos: QPoint) -> None:
+        # 缩略图栏的空白处：等价于「在末尾插入」。
+        if self.context_menu_requested is not None:
+            self.context_menu_requested(None, self._container.mapToGlobal(pos))
 
 
 class ExportDialog(QDialog):
+    start_spin: QSpinBox
+    count_spin: QSpinBox
+    cols_spin: QSpinBox
+    rows_spin: QSpinBox
+    merge_cb: QCheckBox
+    name_edit: QLineEdit
+
     def __init__(self, total_frames: int, default_name: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("导出 BMP")
@@ -479,6 +389,16 @@ class ExportDialog(QDialog):
 
 
 class ImportDialog(QDialog):
+    """选择图片、调色板、抖动误差比例；大图时配置每行帧数。"""
+
+    allow_split: bool
+    need_split: bool
+    palette_combo: QComboBox
+    ratio_spin: QSpinBox
+    fpr_widget: QWidget
+    fpr_spin: QSpinBox
+    fpr_info: QLabel
+
     def __init__(
         self,
         img_path: str,
@@ -486,14 +406,29 @@ class ImportDialog(QDialog):
         palettes: list[str],
         current_palette: str,
         parent: QWidget | None = None,
+        *,
+        allow_split: bool = True,
+        title: str = "导入图片",
     ):
         super().__init__(parent)
-        self.setWindowTitle("导入图片")
+        self.setWindowTitle(title)
         layout = QVBoxLayout(self)
 
         img_w, img_h = img_size
+        self.allow_split = allow_split
+        self.need_split = img_w > MAX_FRAME_SIZE or img_h > MAX_FRAME_SIZE
+
         layout.addWidget(QLabel(f"图片: {img_path}"))
         layout.addWidget(QLabel(f"尺寸: {img_w} x {img_h}"))
+        hint = (
+            f"超过 {MAX_FRAME_SIZE}x{MAX_FRAME_SIZE} 的图片会按下方配置拆成多帧。"
+            if allow_split
+            else f"替换只允许不超过 {MAX_FRAME_SIZE}x{MAX_FRAME_SIZE} 的单帧图片。"
+        )
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)
+        hint_label.setStyleSheet("color: gray;")
+        layout.addWidget(hint_label)
 
         palette_layout = QHBoxLayout()
         palette_layout.addWidget(QLabel("调色板:"))
@@ -524,27 +459,13 @@ class ImportDialog(QDialog):
         self.fpr_info = QLabel()
         fpr_layout.addWidget(self.fpr_info)
         layout.addWidget(self.fpr_widget)
-
-        self.need_split = img_w > 256 or img_h > 256
-        self.fpr_widget.setVisible(self.need_split)
+        self.fpr_widget.setVisible(self.need_split and self.allow_split)
 
         def _update_fpr_info():
-            fpr = self.fpr_spin.value()
-            tiles = []
-            for strip_y in range(0, img_h, 256):
-                strip_h = min(256, img_h - strip_y)
-                for group_x in range(0, img_w, fpr * 256):
-                    for i in range(fpr):
-                        tile_x = group_x + i * 256
-                        if tile_x >= img_w:
-                            break
-                        tile_w = min(256, img_w - tile_x)
-                        tile_h = strip_h
-                        tiles.append((tile_x, strip_y, tile_w, tile_h))
-            self.fpr_info.setText(f"将生成 {len(tiles)} 帧")
+            self.fpr_info.setText(f"将生成 {len(plan_tiles(img_w, img_h, self.fpr_spin.value()))} 帧")
 
         self.fpr_spin.valueChanged.connect(_update_fpr_info)
-        if self.need_split:
+        if self.need_split and self.allow_split:
             _update_fpr_info()
 
         btn_layout = QHBoxLayout()
@@ -561,15 +482,61 @@ class ImportDialog(QDialog):
         return (
             self.palette_combo.currentText(),
             float(self.ratio_spin.value()),
-            self.fpr_spin.value() if self.need_split else 0,
+            self.fpr_spin.value() if self.need_split and self.allow_split else 0,
         )
 
 
+class OffsetDialog(QDialog):
+    """右键菜单里批量设置某一帧的 X / Y 偏移。"""
+
+    x_spin: QSpinBox
+    y_spin: QSpinBox
+
+    def __init__(self, frame_index: int, x_offset: int, y_offset: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"帧 {frame_index} 的偏移")
+        layout = QVBoxLayout(self)
+
+        self.x_spin = QSpinBox()
+        self.x_spin.setRange(OFFSET_MIN, OFFSET_MAX)
+        self.x_spin.setValue(x_offset)
+        self.y_spin = QSpinBox()
+        self.y_spin.setRange(OFFSET_MIN, OFFSET_MAX)
+        self.y_spin.setValue(y_offset)
+
+        form = QFormLayout()
+        form.addRow("X 偏移:", self.x_spin)
+        form.addRow("Y 偏移:", self.y_spin)
+        layout.addLayout(form)
+
+        note = QLabel("偏移写入 DC6 块头，决定帧在动画中的摆放位置。也可以直接双击表格里的 X/Y 列修改。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        layout.addWidget(note)
+
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def values(self) -> tuple[int, int]:
+        return self.x_spin.value(), self.y_spin.value()
+
+
 class ImagePanel(QScrollArea):
+    _original_pixmap: QPixmap | None
+    _zoom: float
+    _image_label: QLabel
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._original_pixmap: QPixmap | None = None
+        self._original_pixmap = None
         self._zoom = 1.0
 
         self._image_label = QLabel()
@@ -618,19 +585,51 @@ class ImagePanel(QScrollArea):
         return f"{int(self._zoom * 100)}%"
 
     @override
-    def eventFilter(self, obj, event):
-        if obj == self.viewport() and event.type() == QEvent.Type.Wheel:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                delta = event.angleDelta().y()
-                if delta > 0:
-                    self.zoom_in()
-                elif delta < 0:
-                    self.zoom_out()
-                return True
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (
+            obj == self.viewport()
+            and isinstance(event, QWheelEvent)
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.zoom_in()
+            elif delta < 0:
+                self.zoom_out()
+            return True
         return super().eventFilter(obj, event)
 
 
 class Dc6Viewer(QMainWindow):
+    # 类级注解让静态检查器明确这些属性的类型（均由 __init__ / _setup_* 赋值）。
+    _dc6: Dc6File | None
+    _source_path: str | None
+    _current_frame: int
+    _modified: bool
+    _is_dark: bool
+    _settings: QSettings
+    frame_table: QTableWidget
+    file_list: QListWidget
+    palette_combo: QComboBox
+    image_panel: ImagePanel
+    thumb_bar: ThumbnailBar
+    _zoom_label: QLabel
+    new_act: QAction
+    open_act: QAction
+    open_dir_act: QAction
+    save_act: QAction
+    save_as_act: QAction
+    close_act: QAction
+    delete_act: QAction
+    import_act: QAction
+    export_act: QAction
+    replace_act: QAction
+    export_frame_act: QAction
+    offset_act: QAction
+    zoom_in_act: QAction
+    zoom_out_act: QAction
+    zoom_reset_act: QAction
+
     def __init__(
         self,
         parent: QWidget | None = None,
@@ -640,9 +639,9 @@ class Dc6Viewer(QMainWindow):
     ):
         super().__init__(parent)
         self._is_dark = is_dark
-        self._dc6: Dc6File | None = None
+        self._dc6 = None
         self._source_path = source_path
-        self._current_frame = 0
+        self._current_frame = -1
         self._modified = False
         self._settings = QSettings("MPQEditor", "DC6Viewer")
         self.setWindowTitle("DC6 Viewer")
@@ -660,6 +659,7 @@ class Dc6Viewer(QMainWindow):
                 if file_dir.is_dir():
                     self._populate_file_list(str(file_dir))
 
+    # ------------------------------------------------------------------ UI
     def _setup_ui(self):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -672,15 +672,22 @@ class Dc6Viewer(QMainWindow):
         self.frame_table.setHorizontalHeaderLabels(["宽度", "高度", "X偏移", "Y偏移"])
         self.frame_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.frame_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.frame_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.frame_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.frame_table.setItemDelegateForColumn(2, OffsetDelegate(self.frame_table))
+        self.frame_table.setItemDelegateForColumn(3, OffsetDelegate(self.frame_table))
+        self.frame_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.frame_table.customContextMenuRequested.connect(self._on_frame_table_context_menu)
+        self.frame_table.itemChanged.connect(self._on_frame_item_changed)
+        self.frame_table.currentCellChanged.connect(self._on_frame_selected)
+        self.frame_table.setToolTip("双击 X/Y 偏移列可编辑；右键可插入、删除、替换或导出帧")
         hh = self.frame_table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hh.resizeSection(0, 55)
         hh.resizeSection(1, 55)
-        hh.resizeSection(2, 55)
-        hh.resizeSection(3, 55)
-        self.frame_table.currentCellChanged.connect(self._on_frame_selected)
-        # self.frame_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        hh.resizeSection(2, 70)
+        hh.resizeSection(3, 70)
 
         self.file_list = QListWidget()
         self.file_list.currentItemChanged.connect(self._on_file_list_selected)
@@ -708,6 +715,7 @@ class Dc6Viewer(QMainWindow):
 
         self.thumb_bar = ThumbnailBar()
         self.thumb_bar.thumb_clicked = self._select_frame
+        self.thumb_bar.context_menu_requested = self._show_frame_menu
         right_layout.addWidget(self.thumb_bar)
 
         splitter.addWidget(right)
@@ -720,10 +728,9 @@ class Dc6Viewer(QMainWindow):
         self.statusBar().showMessage("就绪")
         self.apply_theme(self._is_dark)
 
-    def apply_theme(self, is_dark):
+    def apply_theme(self, is_dark: bool):
         self._is_dark = is_dark
-        style_sheet = self._get_style_sheet()
-        self.frame_table.setStyleSheet(style_sheet)
+        self.frame_table.setStyleSheet(self._get_style_sheet())
 
     def _get_style_sheet(self) -> str:
         common = """
@@ -739,14 +746,13 @@ class Dc6Viewer(QMainWindow):
                 border: none;
             }
             """
-        else:
-            return common + """
-            QTableWidget::item:selected,
-            QTableWidget::item:focus {
-                background-color: #f5f5f5;
-                color: black;
-            }
-            """
+        return common + """
+        QTableWidget::item:selected,
+        QTableWidget::item:focus {
+            background-color: #f5f5f5;
+            color: black;
+        }
+        """
 
     def _setup_actions(self):
         style = self.style()
@@ -763,7 +769,6 @@ class Dc6Viewer(QMainWindow):
         self.open_dir_act = QAction(style.standardIcon(i.SP_DirOpenIcon), "打开目录...", self)
         self.open_dir_act.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.open_dir_act.triggered.connect(self._open_directory)
-        self.open_dir_act.setEnabled(True)
 
         self.save_act = QAction(style.standardIcon(i.SP_DialogSaveButton), "保存", self)
         self.save_act.setShortcut(QKeySequence("Ctrl+S"))
@@ -776,17 +781,33 @@ class Dc6Viewer(QMainWindow):
         self.close_act = QAction(style.standardIcon(i.SP_DialogCloseButton), "关闭", self)
         self.close_act.triggered.connect(self.close)
 
+        self.import_act = QAction(style.standardIcon(i.SP_FileDialogStart), "插入...", self)
+        self.import_act.setShortcut(QKeySequence("Ctrl+I"))
+        self.import_act.setToolTip("插入图像：在当前帧之前插入；超过 256x256 自动拆成多帧")
+        self.import_act.triggered.connect(self._import_image)
+
+        self.replace_act = QAction(style.standardIcon(i.SP_FileDialogContentsView), "替换当前帧...", self)
+        self.replace_act.setShortcut(QKeySequence("Ctrl+R"))
+        self.replace_act.setToolTip("只接受不超过 256x256 的单帧图像")
+        self.replace_act.triggered.connect(self._replace_current_frame)
+
         self.delete_act = QAction(style.standardIcon(i.SP_TrashIcon), "删除帧", self)
         self.delete_act.setShortcut(QKeySequence("Delete"))
+        self.delete_act.setToolTip("删除当前选中的帧")
         self.delete_act.triggered.connect(self._delete_frame)
-
-        self.import_act = QAction(style.standardIcon(i.SP_FileDialogStart), "导入...", self)
-        self.import_act.setShortcut(QKeySequence("Ctrl+I"))
-        self.import_act.triggered.connect(self._import_image)
 
         self.export_act = QAction(style.standardIcon(i.SP_DialogSaveButton), "导出 BMP...", self)
         self.export_act.setShortcut(QKeySequence("Ctrl+E"))
+        self.export_act.setToolTip("把全部帧批量导出为 BMP")
         self.export_act.triggered.connect(self._export_bmp)
+
+        self.export_frame_act = QAction(style.standardIcon(i.SP_DialogSaveButton), "导出当前帧...", self)
+        self.export_frame_act.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.export_frame_act.triggered.connect(self._export_current_frame)
+
+        self.offset_act = QAction(style.standardIcon(i.SP_ArrowRight), "设置 X/Y 偏移...", self)
+        self.offset_act.setShortcut(QKeySequence("Ctrl+Shift+X"))
+        self.offset_act.triggered.connect(self._edit_current_offset)
 
         self.zoom_in_act = QAction(self._make_zoom_icon("+"), "放大", self)
         self.zoom_in_act.setShortcut(QKeySequence("Ctrl+="))
@@ -813,12 +834,19 @@ class Dc6Viewer(QMainWindow):
         file_menu.addAction(self.save_act)
         file_menu.addAction(self.save_as_act)
         file_menu.addSeparator()
-        file_menu.addAction(self.import_act)
         file_menu.addAction(self.export_act)
         file_menu.addSeparator()
-        file_menu.addAction(self.delete_act)
-        file_menu.addSeparator()
         file_menu.addAction(self.close_act)
+
+        frame_menu = menubar.addMenu("帧")
+        frame_menu.addAction(self.import_act)
+        frame_menu.addAction(self.replace_act)
+        frame_menu.addAction(self.delete_act)
+        frame_menu.addSeparator()
+        frame_menu.addAction(self.export_frame_act)
+        frame_menu.addSeparator()
+        frame_menu.addAction(self.offset_act)
+        frame_menu.setToolTipsVisible(True)
 
         view_menu = menubar.addMenu("查看")
         view_menu.addAction(self.zoom_in_act)
@@ -829,6 +857,8 @@ class Dc6Viewer(QMainWindow):
         toolbar = self.addToolBar("工具栏")
         toolbar.setIconSize(QSize(24, 24))
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        # 保持改造前的按钮集合，避免用户习惯的工具栏入口消失。
+        # 新增的帧编辑功能走「帧」菜单与帧列表右键菜单，不挤占工具栏宽度。
         toolbar.addAction(self.new_act)
         toolbar.addAction(self.open_act)
         toolbar.addAction(self.open_dir_act)
@@ -844,134 +874,161 @@ class Dc6Viewer(QMainWindow):
         toolbar.addAction(self.zoom_out_act)
         toolbar.addAction(self.zoom_reset_act)
 
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(spacer)
+        # 缩放按钮的图标本身已能表意，改为纯图标以给左侧带文字的按钮留足空间，
+        # 避免它们被折叠进 ">>" 溢出菜单。
+        for act in (self.zoom_in_act, self.zoom_out_act, self.zoom_reset_act):
+            button = toolbar.widgetForAction(act)
+            if isinstance(button, QToolButton):
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                button.setToolTip(act.text())
+
+        # 缩放百分比放在状态栏，避免工具栏被撑开导致按钮折叠到 ">>" 里。
         self._zoom_label = QLabel("100%")
         self._zoom_label.setStyleSheet("padding: 0 8px;")
-        toolbar.addWidget(self._zoom_label)
+        self.statusBar().addPermanentWidget(self._zoom_label)
 
     def _update_actions(self):
-        has_file = self._dc6 is not None
-        n = self._dc6.total_frames() if has_file else 0
+        dc6 = self._dc6
+        has_file = dc6 is not None
+        n = dc6.total_frames() if dc6 is not None else 0
+        has_frame = has_file and n > 0 and 0 <= self._current_frame < n
         self.save_act.setEnabled(has_file and n > 0)
         self.save_as_act.setEnabled(has_file and n > 0)
-        self.delete_act.setEnabled(has_file and n > 0)
+        self.delete_act.setEnabled(has_frame)
         self.import_act.setEnabled(has_file)
+        self.replace_act.setEnabled(has_frame)
         self.export_act.setEnabled(has_file and n > 0)
+        self.export_frame_act.setEnabled(has_frame)
+        self.offset_act.setEnabled(has_frame)
         self.zoom_in_act.setEnabled(has_file and n > 0)
         self.zoom_out_act.setEnabled(has_file and n > 0)
         self.zoom_reset_act.setEnabled(has_file and n > 0)
 
+    def set_directory_enabled(self, enabled: bool) -> None:
+        """由主程序调用，控制是否允许浏览同目录下的其它 DC6 文件。"""
+        self.open_dir_act.setEnabled(enabled)
+        self.file_list.setVisible(enabled)
+
+    def _last_dir(self, key: str) -> str:
+        """QSettings.value 的静态类型是 object，这里统一收敛成 str。"""
+        return str(self._settings.value(key, ""))
+
+    # ------------------------------------------------------------- 状态刷新
+    def _refresh_title(self):
+        name = Path(self._source_path).name if self._source_path else "未命名"
+        mark = " *" if self._modified else ""
+        self.setWindowTitle(f"DC6 Viewer - {name}{mark}")
+
+    def _populate_frame_table(self, select_row: int | None = None):
+        dc6 = self._dc6
+        if dc6 is None:
+            return
+        total = dc6.total_frames()
+        row = -1
+        if total > 0:
+            row = self._current_frame if select_row is None else select_row
+            row = max(0, min(row, total - 1))
+
+        self.frame_table.blockSignals(True)
+        self.frame_table.setRowCount(total)
+        for i, frame in enumerate(dc6.frames):
+            for col, value in enumerate((frame.width, frame.height, frame.x_offset, frame.y_offset)):
+                item = QTableWidgetItem(str(value))
+                if col < 2:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.frame_table.setItem(i, col, item)
+        if row >= 0:
+            self.frame_table.selectRow(row)
+        self.frame_table.blockSignals(False)
+        self._current_frame = row
+
+    def _populate_thumbnails(self):
+        scroll_pos = self.thumb_bar.horizontalScrollBar().value()
+        self.thumb_bar.clear_thumbs()
+        dc6 = self._dc6
+        if dc6 is None or not dc6.frames:
+            return
+        max_w = max(f.width for f in dc6.frames) or 1
+        max_h = max(f.height for f in dc6.frames) or 1
+        scale = min(THUMB_WIDTH / max_w, THUMB_HEIGHT / max_h, 1.0)
+        for i in range(dc6.total_frames()):
+            pix = QPixmap.fromImage(dc6.get_rgba_image(i))
+            self.thumb_bar.add_thumb(pix, i, scale, selected=(i == self._current_frame))
+        if scroll_pos > 0:
+            QTimer.singleShot(0, lambda: self.thumb_bar.horizontalScrollBar().setValue(scroll_pos))
+
+    def _reload_frames(self, select_row: int | None = None, message: str | None = None):
+        """数据变动后的统一刷新入口。"""
+        dc6 = self._dc6
+        if dc6 is None:
+            return
+        total = dc6.total_frames()
+        if total == 0:
+            self._current_frame = -1
+        else:
+            row = self._current_frame if select_row is None else select_row
+            self._current_frame = max(0, min(row, total - 1))
+        self._populate_frame_table(self._current_frame)
+        self._populate_thumbnails()
+        self._show_frame(self._current_frame)
+        self._update_actions()
+        self._refresh_title()
+        if message:
+            self.statusBar().showMessage(message)
+
+    def _apply_import_palette(self, name: str) -> None:
+        """导入时用的调色板同时切换为显示调色板，颜色才对得上。"""
+        idx = self.palette_combo.findText(name)
+        if idx >= 0 and idx != self.palette_combo.currentIndex():
+            self.palette_combo.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------- 文件操作
     def _new_dc6(self):
-        dc6 = Dc6File.__new__(Dc6File)
-        dc6.version = 6
-        dc6.termination = b"\xee\xee\xee\xee"
-        dc6.frames = []
-        dc6.palette = b""
-        self._dc6 = dc6
+        self._dc6 = Dc6File.blank()
         self._source_path = None
         self._current_frame = -1
         self._modified = False
         self._populate_palettes()
-        self._populate_frame_table()
-        self._populate_thumbnails()
-        self._show_frame(-1)
-        self._update_actions()
-        self.setWindowTitle("DC6 Viewer - 未命名")
-        self.statusBar().showMessage("已创建空白 DC6")
+        self._reload_frames(message="已创建空白 DC6，右键帧列表可插入图像")
 
     def _save(self):
         if not self._dc6:
             return
         if not self._dc6.frames:
-            QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先导入帧")
+            QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先插入帧")
             return
         if self._source_path:
             try:
                 self._write_dc6(self._source_path)
                 self._modified = False
-                name = Path(self._source_path).name
-                self.setWindowTitle(f"DC6 Viewer - {name}")
+                self._refresh_title()
                 self.statusBar().showMessage(f"已保存: {self._source_path}")
-            except Exception as e:
+            except OSError as e:
                 QMessageBox.critical(self, "保存失败", str(e))
         else:
             self._save_as()
 
-    def _delete_frame(self):
-        if not self._dc6 or self._dc6.total_frames() <= 0:
-            return
-        idx = self._current_frame
-        del self._dc6.frames[idx]
-        self._modified = True
-        if self._dc6.total_frames() == 0:
-            self._current_frame = -1
-            self._show_frame(-1)
-        else:
-            if self._current_frame >= self._dc6.total_frames():
-                self._current_frame = self._dc6.total_frames() - 1
-            self._show_frame(self._current_frame)
-        self._populate_frame_table()
-        self._populate_thumbnails()
-        self._update_actions()
-        self.statusBar().showMessage(f"已删除帧 {idx}")
-
-    def _import_image(self):
+    def _save_as(self):
         if not self._dc6:
             return
-        last_dir = self._settings.value("last_import_dir", "")
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择导入图片", last_dir,
-            "图片文件 (*.png *.bmp *.jpg *.jpeg *.gif *.tga);;所有文件 (*)",
-        )
-        if not path:
+        if not self._dc6.frames:
+            QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先插入帧")
             return
-        self._settings.setValue("last_import_dir", str(Path(path).parent))
+        path, _ = QFileDialog.getSaveFileName(self, "另存为 DC6", "", "DC6 文件 (*.dc6);;所有文件 (*)")
+        if path:
+            try:
+                self._write_dc6(path)
+                self._source_path = path
+                self._modified = False
+                self._refresh_title()
+                self.statusBar().showMessage(f"已保存: {path}")
+            except OSError as e:
+                QMessageBox.critical(self, "保存失败", str(e))
 
-        img = QImage(path)
-        if img.isNull():
-            QMessageBox.critical(self, "导入失败", "无法加载图片")
+    def _write_dc6(self, path: str):
+        if not self._dc6:
             return
-
-        palettes = list_palettes()
-        current_pal = self.palette_combo.currentText()
-        dlg = ImportDialog(path, (img.width(), img.height()), palettes, current_pal, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        pal_name, ratio, fpr = dlg.settings()
-
-        try:
-            palette_data = load_palette(pal_name)
-        except Exception as e:
-            QMessageBox.critical(self, "调色板错误", str(e))
-            return
-
-        dithered = floyd_steinberg_dither(img, palette_data, ratio)
-
-        if fpr > 0:
-            tiles = split_image_tiles(dithered, fpr)
-        else:
-            tiles = [(0, 0, dithered.width(), dithered.height(), dithered)]
-        insert_pos = max(0, self._current_frame)
-        new_frames = []
-        for _tx, _ty, tw, th, tile_img in tiles:
-            pixels = bytearray(tw * th)
-            for y in range(th):
-                scan = tile_img.constScanLine(y)
-                pixels[y * tw : (y + 1) * tw] = scan[:tw]
-            new_frames.append(FrameInfo(width=tw, height=th, pixels=pixels))
-
-        for i, frame in enumerate(new_frames):
-            self._dc6.frames.insert(insert_pos + i, frame)
-
-        self._modified = True
-        self._populate_frame_table()
-        self._populate_thumbnails()
-        self._show_frame(self._current_frame)
-        self._update_actions()
-        self.statusBar().showMessage(f"已导入 {len(new_frames)} 帧")
+        Path(path).write_bytes(build_dc6_bytes(self._dc6))
 
     def load_data(self, data: bytes, source_path: str | None = None):
         try:
@@ -980,13 +1037,8 @@ class Dc6Viewer(QMainWindow):
             self._current_frame = 0
             self._modified = False
             self._populate_palettes()
-            self._populate_frame_table()
-            self._populate_thumbnails()
-            self._show_frame(0)
-            self._update_actions()
-            name = Path(source_path).name if source_path else "untitled"
-            self.setWindowTitle(f"DC6 Viewer - {name}")
-            self.statusBar().showMessage(f"已加载: {name} ({self._dc6.total_frames()} 帧)")
+            self._reload_frames(message=f"已加载: {Path(source_path).name if source_path else 'untitled'} "
+                                        f"({self._dc6.total_frames()} 帧)")
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
 
@@ -1002,47 +1054,16 @@ class Dc6Viewer(QMainWindow):
         self.palette_combo.blockSignals(False)
         self._on_palette_changed(self.palette_combo.currentText())
 
-    def _populate_frame_table(self):
-        if not self._dc6:
-            return
-        self.frame_table.blockSignals(True)
-        self.frame_table.setRowCount(self._dc6.total_frames())
-        for i, frame in enumerate(self._dc6.frames):
-            self.frame_table.setItem(i, 0, QTableWidgetItem(str(frame.width)))
-            self.frame_table.setItem(i, 1, QTableWidgetItem(str(frame.height)))
-            self.frame_table.setItem(i, 2, QTableWidgetItem(str(frame.x_offset)))
-            self.frame_table.setItem(i, 3, QTableWidgetItem(str(frame.y_offset)))
-        self.frame_table.blockSignals(False)
-        if self._dc6.total_frames() > 0:
-            self.frame_table.selectRow(0)
-
-    def _populate_thumbnails(self):
-        scroll_pos = self.thumb_bar.horizontalScrollBar().value()
-        self.thumb_bar.clear_thumbs()
-        if not self._dc6 or not self._dc6.frames:
-            return
-        max_w = max(f.width for f in self._dc6.frames) or 1
-        max_h = max(f.height for f in self._dc6.frames) or 1
-        scale = min(THUMB_WIDTH / max_w, THUMB_HEIGHT / max_h, 1.0)
-        for i in range(self._dc6.total_frames()):
-            img = self._dc6.get_rgba_image(i)
-            pix = QPixmap.fromImage(img)
-            self.thumb_bar.add_thumb(pix, i, scale, selected=(i == self._current_frame))
-        if scroll_pos > 0:
-            QTimer.singleShot(0, lambda: self.thumb_bar.horizontalScrollBar().setValue(scroll_pos))
-
     def _populate_file_list(self, directory: str):
         scroll_pos = self.file_list.verticalScrollBar().value()
         self.file_list.blockSignals(True)
         self.file_list.clear()
-        dc6_files = sorted(Path(directory).glob("*.dc6"))
-        for f in dc6_files:
+        for f in sorted(Path(directory).glob("*.dc6")):
             item = QListWidgetItem(f.name)
             item.setData(Qt.ItemDataRole.UserRole, str(f))
             self.file_list.addItem(item)
         if self._source_path:
-            current_name = Path(self._source_path).name
-            items = self.file_list.findItems(current_name, Qt.MatchFlag.MatchExactly)
+            items = self.file_list.findItems(Path(self._source_path).name, Qt.MatchFlag.MatchExactly)
             if items:
                 self.file_list.setCurrentItem(items[0])
                 self.file_list.scrollToItem(items[0])
@@ -1057,40 +1078,264 @@ class Dc6Viewer(QMainWindow):
         path = current.data(Qt.ItemDataRole.UserRole)
         if path and Path(path).is_file():
             try:
-                data = Path(path).read_bytes()
-                self.load_data(data, path)
-            except Exception as e:
+                self.load_data(Path(path).read_bytes(), path)
+            except OSError as e:
                 self.statusBar().showMessage(f"打开失败: {e}")
 
     def _open_directory(self):
-        last_dir = self._settings.value("last_open_dir", "")
+        last_dir = self._last_dir("last_open_dir")
         directory = QFileDialog.getExistingDirectory(self, "打开 DC6 目录", last_dir)
         if directory:
             self._settings.setValue("last_open_dir", directory)
-            self._populate_file_list(str(directory))
+            self._populate_file_list(directory)
             if self.file_list.count() > 0:
                 self.file_list.setCurrentRow(0)
 
+    def _open_file(self):
+        last_dir = self._last_dir("last_open_dir")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开 DC6 文件", last_dir, "DC6 文件 (*.dc6);;所有文件 (*)"
+        )
+        if path:
+            self._settings.setValue("last_open_dir", str(Path(path).parent))
+            try:
+                self.load_data(Path(path).read_bytes(), path)
+                self.file_list.clearSelection()
+            except OSError as e:
+                QMessageBox.critical(self, "打开失败", str(e))
+
+    # ------------------------------------------------------------- 帧编辑
+    def _choose_image_frames(self, allow_split: bool) -> tuple[list[FrameInfo], str] | None:
+        """选图片 → 抖动 → 切片 → 帧数据；返回 (帧列表, 调色板名) 或取消。"""
+        last_dir = self._last_dir("last_import_dir")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "替换图像" if not allow_split else "插入图像",
+            last_dir,
+            "图片文件 (*.png *.bmp *.jpg *.jpeg *.gif *.tga);;所有文件 (*)",
+        )
+        if not path:
+            return None
+        self._settings.setValue("last_import_dir", str(Path(path).parent))
+
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.critical(self, "读取失败", "无法加载图片")
+            return None
+        if not allow_split:
+            try:
+                validate_frame_size(img.width(), img.height())
+            except FrameSizeError as e:
+                QMessageBox.critical(self, "替换失败", str(e))
+                return None
+
+        palettes = list_palettes()
+        title = "替换图像" if not allow_split else "插入图像"
+        dlg = ImportDialog(
+            path,
+            (img.width(), img.height()),
+            palettes,
+            self.palette_combo.currentText(),
+            self,
+            allow_split=allow_split,
+            title=title,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        pal_name, ratio, fpr = dlg.settings()
+        try:
+            palette_data = load_palette(pal_name)
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "调色板错误", str(e))
+            return None
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage("正在转换图像，请稍候...")
+        try:
+            frames = frames_from_image(img, palette_data, ratio, fpr, allow_split=allow_split)
+        except ValueError as e:
+            QMessageBox.critical(self, "图像错误", str(e))
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        return frames, pal_name
+
+    def _insert_frames_at(self, position: int) -> None:
+        dc6 = self._dc6
+        if dc6 is None:
+            return
+        chosen = self._choose_image_frames(allow_split=True)
+        if chosen is None:
+            return
+        frames, pal_name = chosen
+        pos = insert_frames(dc6, position, frames)
+        self._apply_import_palette(pal_name)
+        self._modified = True
+        self._reload_frames(select_row=pos, message=f"已在位置 {pos} 插入 {len(frames)} 帧")
+
+    def _import_image(self):
+        self._insert_frames_at(max(0, self._current_frame))
+
+    def _replace_frame_at(self, index: int) -> None:
+        dc6 = self._dc6
+        if dc6 is None:
+            return
+        chosen = self._choose_image_frames(allow_split=False)
+        if chosen is None:
+            return
+        frames, pal_name = chosen
+        try:
+            replace_frame(dc6, index, frames[0])
+        except (FrameIndexError, FrameSizeError) as e:
+            QMessageBox.critical(self, "替换失败", str(e))
+            return
+        self._apply_import_palette(pal_name)
+        self._modified = True
+        self._reload_frames(select_row=index, message=f"已替换帧 {index}（保留原 X/Y 偏移）")
+
+    def _replace_current_frame(self):
+        self._replace_frame_at(self._current_frame)
+
+    def _delete_frame_at(self, index: int) -> None:
+        dc6 = self._dc6
+        if dc6 is None:
+            return
+        try:
+            delete_frame(dc6, index)
+        except FrameIndexError:
+            return
+        self._modified = True
+        next_row = min(index, dc6.total_frames() - 1)
+        self._reload_frames(select_row=next_row, message=f"已删除帧 {index}")
+
+    def _delete_frame(self):
+        self._delete_frame_at(self._current_frame)
+
+    def _apply_offsets(self, index: int, x: int, y: int) -> bool:
+        dc6 = self._dc6
+        if dc6 is None:
+            return False
+        try:
+            set_frame_offset(dc6, index, x=x, y=y)
+        except (FrameIndexError, ValueError) as e:
+            QMessageBox.warning(self, "偏移错误", str(e))
+            return False
+        item_x = self.frame_table.item(index, 2)
+        item_y = self.frame_table.item(index, 3)
+        self.frame_table.blockSignals(True)
+        if item_x is not None:
+            item_x.setText(str(x))
+        if item_y is not None:
+            item_y.setText(str(y))
+        self.frame_table.blockSignals(False)
+        self._modified = True
+        self._refresh_title()
+        self.statusBar().showMessage(f"帧 {index} 偏移已设为 ({x}, {y})")
+        return True
+
+    def _edit_offset_at(self, index: int) -> None:
+        dc6 = self._dc6
+        if dc6 is None or not 0 <= index < dc6.total_frames():
+            return
+        frame = dc6.frames[index]
+        dlg = OffsetDialog(index, frame.x_offset, frame.y_offset, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            x, y = dlg.values()
+            self._apply_offsets(index, x, y)
+
+    def _edit_current_offset(self):
+        self._edit_offset_at(self._current_frame)
+
+    def _on_frame_item_changed(self, item: QTableWidgetItem) -> None:
+        """双击 X/Y 单元格内联编辑后的提交处理。"""
+        dc6 = self._dc6
+        if dc6 is None:
+            return
+        col = item.column()
+        row = item.row()
+        if col not in (2, 3) or row >= dc6.total_frames():
+            return
+        try:
+            value = int(item.text().strip())
+            validate_offset(value)
+        except ValueError as e:
+            self._restore_offset_cell(row, col)
+            QMessageBox.warning(self, "偏移错误", str(e))
+            return
+        frame = dc6.frames[row]
+        x = value if col == 2 else frame.x_offset
+        y = value if col == 3 else frame.y_offset
+        if not self._apply_offsets(row, x, y):
+            self._restore_offset_cell(row, col)
+
+    def _restore_offset_cell(self, row: int, col: int) -> None:
+        dc6 = self._dc6
+        if dc6 is None or row >= dc6.total_frames():
+            return
+        frame = dc6.frames[row]
+        value = frame.x_offset if col == 2 else frame.y_offset
+        item = self.frame_table.item(row, col)
+        if item is None:
+            return
+        self.frame_table.blockSignals(True)
+        item.setText(str(value))
+        self.frame_table.blockSignals(False)
+
+    # ------------------------------------------------------------- 右键菜单
+    def _on_frame_table_context_menu(self, pos: QPoint) -> None:
+        dc6 = self._dc6
+        if dc6 is None:
+            self._show_frame_menu(None, self.frame_table.viewport().mapToGlobal(pos))
+            return
+        row = self.frame_table.rowAt(pos.y())
+        index = row if 0 <= row < dc6.total_frames() else None
+        self._show_frame_menu(index, self.frame_table.viewport().mapToGlobal(pos))
+
+    def _show_frame_menu(self, index: int | None, global_pos: QPoint) -> None:
+        """帧列表 / 缩略图共用的右键菜单；index=None 表示点在空白处。"""
+        dc6 = self._dc6
+        menu = QMenu(self)
+        handlers: dict[QAction, Callable[[], None]] = {}
+
+        if dc6 is None:
+            handlers[menu.addAction("新建空白 DC6")] = self._new_dc6
+        elif index is None:
+            handlers[menu.addAction("在末尾插入图像...")] = lambda: self._insert_frames_at(dc6.total_frames())
+        else:
+            i = index
+            handlers[menu.addAction(f"在帧 {i} 之前插入图像...")] = lambda i=i: self._insert_frames_at(i)
+            handlers[menu.addAction(f"在帧 {i} 之后插入图像...")] = lambda i=i: self._insert_frames_at(i + 1)
+            menu.addSeparator()
+            handlers[menu.addAction("替换此帧图像...")] = lambda i=i: self._replace_frame_at(i)
+            handlers[menu.addAction("删除此帧")] = lambda i=i: self._delete_frame_at(i)
+            handlers[menu.addAction("导出此帧...")] = lambda i=i: self._export_frame_at(i)
+            menu.addSeparator()
+            handlers[menu.addAction("设置 X/Y 偏移...")] = lambda i=i: self._edit_offset_at(i)
+
+        chosen = menu.exec(global_pos)
+        if chosen is not None and chosen in handlers:
+            handlers[chosen]()
+
+    # ------------------------------------------------------------- 显示 / 缩放
     def _show_frame(self, index: int):
-        if not self._dc6 or index < 0 or index >= self._dc6.total_frames():
+        dc6 = self._dc6
+        if dc6 is None or index < 0 or index >= dc6.total_frames():
             self.image_panel.clear_image()
             return
-        img = self._dc6.get_rgba_image(index)
-        pix = QPixmap.fromImage(img)
-        self.image_panel.set_image(pix)
+        self.image_panel.set_image(QPixmap.fromImage(dc6.get_rgba_image(index)))
         self._zoom_label.setText(self.image_panel.zoom_text())
 
     def _select_frame(self, index: int):
-        self._current_frame = index
-        self.frame_table.selectRow(index)
-        self._show_frame(index)
-        self._populate_thumbnails()
+        self._reload_frames(select_row=index)
 
     def _on_frame_selected(self, row: int, _col: int, _prev_row: int, _prev_col: int):
         if row >= 0 and row != self._current_frame:
             self._current_frame = row
             self._show_frame(row)
             self._populate_thumbnails()
+            self._update_actions()
 
     def _zoom_in(self):
         self.image_panel.zoom_in()
@@ -1111,81 +1356,46 @@ class Dc6Viewer(QMainWindow):
             self._dc6.palette = load_palette(name)
             self._show_frame(self._current_frame)
             self._populate_thumbnails()
-        except Exception as e:
+        except (OSError, ValueError) as e:
             self.statusBar().showMessage(f"调色板加载失败: {e}")
 
-    def _open_file(self):
-        last_dir = self._settings.value("last_open_dir", "")
-        path, _ = QFileDialog.getOpenFileName(
-            self, "打开 DC6 文件", last_dir, "DC6 文件 (*.dc6);;所有文件 (*)"
-        )
-        if path:
-            self._settings.setValue("last_open_dir", str(Path(path).parent))
-            with Path(path).open("rb") as f:
-                data = f.read()
-            self.load_data(data, path)
-            self.file_list.clearSelection()
-
-    def _save_as(self):
-        if not self._dc6:
-            return
-        if not self._dc6.frames:
-            QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先导入帧")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "另存为 DC6", "", "DC6 文件 (*.dc6);;所有文件 (*)"
-        )
-        if path:
-            try:
-                self._write_dc6(path)
-                self._source_path = path
-                self._modified = False
-                name = Path(path).name
-                self.setWindowTitle(f"DC6 Viewer - {name}")
-                self.statusBar().showMessage(f"已保存: {path}")
-            except Exception as e:
-                QMessageBox.critical(self, "保存失败", str(e))
-
-    def _write_dc6(self, path: str):
-        buf = io.BytesIO()
+    # ------------------------------------------------------------- 导出
+    def _export_frame_at(self, index: int) -> None:
         dc6 = self._dc6
+        if dc6 is None:
+            return
+        last_dir = self._last_dir("last_export_dir")
+        default = str(Path(last_dir) / frame_export_name(self._source_path, index)) if last_dir else frame_export_name(
+            self._source_path, index
+        )
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            f"导出帧 {index}",
+            default,
+            "BMP 索引色 (*.bmp);;PNG 透明 (*.png);;JPEG (*.jpg);;所有文件 (*)",
+        )
+        if not path:
+            return
+        dest = Path(path)
+        if not dest.suffix:
+            ext = ".png" if selected_filter.startswith("PNG") else ".jpg" if selected_filter.startswith("JPEG") else ".bmp"
+            dest = dest.with_suffix(ext)
+        try:
+            export_frame(dc6, index, dest)
+        except (OSError, ValueError, FrameIndexError) as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+            return
+        self._settings.setValue("last_export_dir", str(dest.parent))
+        self.statusBar().showMessage(f"已导出: {dest}")
+        QMessageBox.information(self, "导出完成", f"已导出帧 {index}:\n{dest}")
 
-        buf.write(struct.pack("<III", dc6.version, 1, 0))
-        buf.write(dc6.termination[:4].ljust(4, b"\xee"))
-        buf.write(struct.pack("<II", 1, dc6.total_frames()))
+    def _export_current_frame(self):
+        self._export_frame_at(self._current_frame)
 
-        pointer_table_offset = buf.tell()
-        for _ in range(dc6.total_frames()):
-            buf.write(struct.pack("<I", 0))
-
-        pointers: list[int] = []
-        for _ in range(dc6.total_frames()):
-            pointers.append(buf.tell())
-            frame = dc6.frames[_]
-
-            block_start = buf.tell()
-            buf.write(struct.pack("<IIIIIIII", 0, frame.width, frame.height, 0, 0, 0, 0, 0))
-
-            data_start = buf.tell()
-            compressed = compress_frame(bytes(frame.pixels), frame.width, frame.height)
-            buf.write(compressed)
-            data_end = buf.tell()
-
-            buf.write(b"\xee\xee\xee")
-            block_end = buf.tell()
-
-            buf.seek(block_start + 24)
-            buf.write(struct.pack("<II", block_end, data_end - data_start))
-            buf.seek(block_end)
-
-        buf.seek(pointer_table_offset)
-        for p in pointers:
-            buf.write(struct.pack("<I", p))
-
-        with Path(path).open("wb") as f:
-            f.write(buf.getvalue())
-
-    def _build_grid_image(self, base_frame: int, count: int, cols: int, rows: int) -> QImage | None:
+    def _build_grid_image(self, base_frame: int, count: int, cols: int, _rows: int) -> QImage | None:
+        dc6 = self._dc6
+        if dc6 is None:
+            return None
         rows = (count + cols - 1) // cols
         total_w = 0
         total_h = 0
@@ -1197,13 +1407,10 @@ class Dc6Viewer(QMainWindow):
                 index = i * cols + j
                 if index >= count:
                     break
-                frame_index = base_frame + index
-                f = self._dc6.frames[frame_index]
+                f = dc6.frames[base_frame + index]
                 row_width += f.width
-                if f.height > max_row_height:
-                    max_row_height = f.height
-            if row_width > total_w:
-                total_w = row_width
+                max_row_height = max(max_row_height, f.height)
+            total_w = max(total_w, row_width)
             row_heights.append(max_row_height)
         total_h = sum(row_heights)
         if total_w == 0 or total_h == 0:
@@ -1212,44 +1419,37 @@ class Dc6Viewer(QMainWindow):
         composite = QImage(total_w, total_h, QImage.Format.Format_Indexed8)
         composite.setColorCount(256)
         for i in range(256):
-            if i * 3 + 2 < len(self._dc6.palette):
-                b = self._dc6.palette[i * 3]
-                g = self._dc6.palette[i * 3 + 1]
-                r = self._dc6.palette[i * 3 + 2]
-            else:
-                r = g = b = 0
+            r, g, b = palette_rgb(dc6.palette, i)
             composite.setColor(i, QColor(r, g, b).rgb())
         composite.fill(0)
 
         fy = 0
         for i in range(rows):
             fx = 0
-            max_row_height = 0
             for j in range(cols):
                 index = i * cols + j
                 if index >= count:
                     break
-                frame_index = base_frame + index
-                f = self._dc6.frames[frame_index]
+                f = dc6.frames[base_frame + index]
                 for y in range(f.height):
                     for x in range(f.width):
-                        val = f.pixels[y * f.width + x]
-                        composite.setPixel(fx + x, fy + y, val)
+                        composite.setPixel(fx + x, fy + y, f.pixels[y * f.width + x])
                 fx += f.width
             fy += row_heights[i]
         return composite
 
     def _export_bmp(self):
-        if not self._dc6:
+        dc6 = self._dc6
+        if dc6 is None:
             return
         default_name = Path(self._source_path).stem if self._source_path else "export"
-        dlg = ExportDialog(self._dc6.total_frames(), default_name, self)
+        dlg = ExportDialog(dc6.total_frames(), default_name, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         start_frame, count, cols, rows, merge_mode, base_name = dlg.settings()
 
-        last_export = self._settings.value("last_export_dir", "")
+        last_export = self._last_dir("last_export_dir")
         dest_dir = QFileDialog.getExistingDirectory(self, "选择导出目录", last_export)
         if not dest_dir:
             return
@@ -1278,13 +1478,9 @@ class Dc6Viewer(QMainWindow):
             merged = QImage(total_w, total_h, QImage.Format.Format_Indexed8)
             merged.setColorCount(256)
             for i in range(256):
-                if i * 3 + 2 < len(self._dc6.palette):
-                    b = self._dc6.palette[i * 3]
-                    g = self._dc6.palette[i * 3 + 1]
-                    r = self._dc6.palette[i * 3 + 2]
-                else:
-                    r = g = b = 0
+                r, g, b = palette_rgb(dc6.palette, i)
                 merged.setColor(i, QColor(r, g, b).rgb())
+            merged.fill(0)
 
             x_offset = 0
             for grid in grid_images:
@@ -1295,15 +1491,12 @@ class Dc6Viewer(QMainWindow):
 
             bmp_path = str(Path(dest_dir) / f"{base_name}.bmp")
             merged.save(bmp_path)
-            self.statusBar().showMessage(f"已导出 1 个合并文件")
+            self.statusBar().showMessage("已导出 1 个合并文件")
             QMessageBox.information(self, "导出完成", f"已导出 1 个合并 BMP 文件: {base_name}.bmp")
         else:
-            exported = []
+            exported: list[str] = []
             for img_idx, grid in enumerate(grid_images):
-                if num_images == 1:
-                    bmp_name = f"{base_name}.bmp"
-                else:
-                    bmp_name = f"{base_name}-{img_idx:02d}.bmp"
+                bmp_name = f"{base_name}.bmp" if num_images == 1 else f"{base_name}-{img_idx:02d}.bmp"
                 bmp_path = str(Path(dest_dir) / bmp_name)
                 grid.save(bmp_path)
                 exported.append(bmp_path)
@@ -1319,11 +1512,9 @@ class Dc6Viewer(QMainWindow):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         pal = QApplication.palette()
         fg = pal.color(QPalette.ColorRole.ButtonText)
-        pen = QPen(fg, 2)
-        p.setPen(pen)
+        p.setPen(QPen(fg, 2))
         p.drawEllipse(2, 2, 20, 20)
-        font = QFont("sans-serif", 14, QFont.Weight.Bold)
-        p.setFont(font)
+        p.setFont(QFont("sans-serif", 14, QFont.Weight.Bold))
         p.drawText(0, 1, size, size, Qt.AlignmentFlag.AlignCenter, text)
         p.end()
         return QIcon(pix)
@@ -1337,11 +1528,18 @@ class Dc6Viewer(QMainWindow):
 
 
 class Dc6PreviewPanel(QWidget):
+    _dc6: Dc6File | None
+    _current_palette: str
+    _pixmap: QPixmap | None
+    palette_combo: QComboBox
+    info_label: QLabel
+    image_label: QLabel
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._dc6: Dc6File | None = None
+        self._dc6 = None
         self._current_palette = "act1"
-        self._pixmap: QPixmap | None = None
+        self._pixmap = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1398,7 +1596,7 @@ class Dc6PreviewPanel(QWidget):
         try:
             self._dc6.palette = load_palette(self.palette_combo.currentText())
             self._show_preview()
-        except Exception:
+        except (OSError, ValueError):
             pass
 
     def _on_palette_changed(self, name: str):
@@ -1407,20 +1605,18 @@ class Dc6PreviewPanel(QWidget):
             self._apply_palette()
 
     def _show_preview(self):
-        if not self._dc6 or not self._dc6.frames:
+        dc6 = self._dc6
+        if dc6 is None or not dc6.frames:
             self.image_label.clear()
             return
 
-        best_idx = max(
-            range(len(self._dc6.frames)),
-            key=lambda i: self._dc6.frames[i].width * self._dc6.frames[i].height,
-        )
+        best_idx = max(range(len(dc6.frames)), key=lambda i: dc6.frames[i].width * dc6.frames[i].height)
 
-        img = self._dc6.get_rgba_image(best_idx)
+        img = dc6.get_rgba_image(best_idx)
         self._pixmap = QPixmap.fromImage(img)
         self._update_scaled()
 
-        self.info_label.setText(f"{self._dc6.total_frames()} 帧 | 最大帧: {best_idx}")
+        self.info_label.setText(f"{dc6.total_frames()} 帧 | 最大帧: {best_idx}")
 
     def _update_scaled(self):
         if self._pixmap is None:
@@ -1438,7 +1634,7 @@ class Dc6PreviewPanel(QWidget):
         self.image_label.setPixmap(scaled)
 
     @override
-    def resizeEvent(self, event):
+    def resizeEvent(self, event: QResizeEvent):
         super().resizeEvent(event)
         self._update_scaled()
 
@@ -1451,13 +1647,12 @@ def show_dc6_window(
     enable_directory: bool = True,
 ) -> Dc6Viewer:
     viewer = Dc6Viewer(parent, data, source_path, is_dark=is_dark)
+    viewer.set_directory_enabled(enable_directory)
     viewer.show()
     return viewer
 
 
 def main():
-    import sys
-
     app = QApplication(sys.argv)
     app.setApplicationName("DC6 Viewer")
 
@@ -1470,13 +1665,14 @@ def main():
         path = sys.argv[1]
         try:
             data = Path(path).read_bytes()
-        except Exception as e:
+        except OSError as e:
             print(f"Error: {e}")
             sys.exit(1)
 
     viewer = Dc6Viewer(data=data)
     if data:
         viewer._source_path = sys.argv[1]
+        viewer._refresh_title()
     viewer.show()
     sys.exit(app.exec())
 

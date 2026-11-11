@@ -15,15 +15,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mpq_editor.listfiles import scan_listfiles
+
+_AUTO = "auto"
+_NONE = "none"
+
 
 class OpenOptionsDialog(QDialog):
     encoding_combo: QComboBox
-    list_path_edit: QLineEdit
+    listfile_combo: QComboBox
 
-    def __init__(self, mpq_path: str, current_encoding: str, parent: QWidget | None = None):
+    def __init__(
+        self,
+        mpq_path: str,
+        current_encoding: str,
+        parent: QWidget | None = None,
+        listfiles: list[Path] | None = None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle(f"打开 MPQ - {mpq_path.split('/')[-1].split('\\\\')[-1]}")
-        self.resize(500, 300)
+        self._listfiles = listfiles if listfiles is not None else scan_listfiles()
+        self.setWindowTitle(f"打开 MPQ - {Path(mpq_path).name}")
+        self.resize(520, 320)
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel(f"文件: {mpq_path}"))
@@ -40,19 +52,28 @@ class OpenOptionsDialog(QDialog):
         enc_layout.addStretch()
         layout.addLayout(enc_layout)
 
-        list_path_layout = QHBoxLayout()
-        list_path_layout.addWidget(QLabel("文件列表（可选）："))
-        self.list_path_edit = QLineEdit()
-        self.list_path_edit.setPlaceholderText("选择 .txt 文件，每行一个文件名...")
+        list_layout = QHBoxLayout()
+        list_layout.addWidget(QLabel("列表文件："))
+        self.listfile_combo = QComboBox()
+        self.listfile_combo.addItem(
+            "自动匹配（使用程序目录下全部列表文件）", _AUTO
+        )
+        self.listfile_combo.addItem("（不使用列表文件）", _NONE)
+        for p in self._listfiles:
+            self.listfile_combo.addItem(p.name, str(p))
+        self.listfile_combo.setCurrentIndex(0)
+        list_layout.addWidget(self.listfile_combo, 1)
         browse_btn = QPushButton("浏览...")
         browse_btn.clicked.connect(self._browse_list)
-        list_path_layout.addWidget(self.list_path_edit)
-        list_path_layout.addWidget(browse_btn)
-        layout.addLayout(list_path_layout)
+        list_layout.addWidget(browse_btn)
+        layout.addLayout(list_layout)
 
-        list_info = QLabel("留空则显示 MPQ 中所有文件")
-        list_info.setStyleSheet("color: gray;")
-        layout.addWidget(list_info)
+        info = QLabel(
+            "列表文件用于识别 MPQ 中未命名的文件（如 File00000001.xxx）。\n"
+            "默认扫描程序目录下的 Listfiles 文件夹，也可以选择其他文件。"
+        )
+        info.setStyleSheet("color: gray;")
+        layout.addWidget(info)
 
         layout.addStretch()
 
@@ -68,23 +89,28 @@ class OpenOptionsDialog(QDialog):
 
     def _browse_list(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择文件列表", "", "文本文件 (*.txt);;所有文件 (*)"
+            self, "选择列表文件", "", "文本文件 (*.txt);;所有文件 (*)"
         )
         if path:
-            self.list_path_edit.setText(path)
+            label = f"自定义: {Path(path).name}"
+            for i in range(self.listfile_combo.count()):
+                if self.listfile_combo.itemData(i) == path:
+                    self.listfile_combo.setCurrentIndex(i)
+                    return
+            self.listfile_combo.addItem(label, path)
+            self.listfile_combo.setCurrentIndex(self.listfile_combo.count() - 1)
 
     def encoding(self) -> str:
         return self.encoding_combo.currentText()
 
-    def file_list_data(self) -> list[str]:
-        path = self.list_path_edit.text().strip()
-        if not path:
+    def selected_listfile_paths(self) -> list[str]:
+        """返回要应用的列表文件路径（自动匹配时为全部，未使用时为空）。"""
+        data = self.listfile_combo.currentData()
+        if data == _AUTO:
+            return [str(p) for p in self._listfiles]
+        if data == _NONE or data is None:
             return []
-        try:
-            with Path(path).open(encoding="utf-8", errors="ignore") as f:
-                return [line.strip() for line in f if line.strip()]
-        except Exception:
-            return []
+        return [str(data)]
 
 
 class NewDirDialog(QDialog):

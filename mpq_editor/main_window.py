@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import override
-import sys
 
 from PySide6.QtCore import QSettings, QSize, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QKeySequence, QPalette
@@ -22,13 +22,12 @@ from PySide6.QtWidgets import (
 
 SETTINGS_PATH = str(Path(__file__).parent / "settings.ini")
 
+from dc6.dc6_viewer import Dc6PreviewPanel, Dc6Viewer
 from mpq_editor.dialogs import EncodingDialog, OpenOptionsDialog
 from mpq_editor.drag_drop import ErrorAction, handle_batch_error
 from mpq_editor.file_list_widget import FileListWidget
 from mpq_editor.mpq_model import MPQModel
 from mpq_editor.tree_widget import TreeWidget
-
-from dc6.dc6_viewer import Dc6PreviewPanel, Dc6Viewer
 
 
 class MainWindow(QMainWindow):
@@ -205,11 +204,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(title)
 
     def _restore_settings(self):
-        last_mpq_dir = self.settings.value("last_mpq_dir", "")
-        saved_encoding = self.settings.value("encoding", "")
+        saved_encoding = str(self.settings.value("encoding", ""))
         if saved_encoding:
             self.model.encoding = saved_encoding
-        self._theme = self.settings.value("theme", "light")
+        self._theme = str(self.settings.value("theme", "light"))
 
     def _save_settings(self):
         if self.model.file_path:
@@ -271,15 +269,21 @@ class MainWindow(QMainWindow):
             return
 
         self.model.encoding = dlg.encoding()
-        file_list = dlg.file_list_data() or None
         try:
-            self.model.open(path, file_list)
+            self.model.open(path, dlg.selected_listfile_paths())
             self.file_list.current_dir = ""
             self.setWindowTitle(f"MPQ 编辑器 - {Path(path).name}")
             self.statusBar().showMessage(f"已打开: {path}")
             self.settings.setValue("last_mpq_dir", str(Path(path).parent))
         except Exception as e:
             QMessageBox.critical(self, "打开失败", f"无法打开 MPQ 文件:\n{e}")
+            return
+        if self.model.listfile_errors:
+            QMessageBox.warning(
+                self,
+                "列表文件",
+                "以下列表文件应用失败：\n" + "\n".join(self.model.listfile_errors),
+            )
 
     def _new_mpq(self):
         last_dir: str = self.settings.value("last_mpq_dir", "")  # type: ignore
@@ -429,6 +433,8 @@ class MainWindow(QMainWindow):
 
     def _init_theme(self):
         app = QApplication.instance()
+        if not isinstance(app, QApplication):
+            return
         self._light_palette = app.palette()
         self._apply_theme(self._theme)
 
@@ -453,7 +459,7 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, theme: str):
         app = QApplication.instance()
-        if not app:
+        if not isinstance(app, QApplication):
             return
         if theme == "dark":
             palette = QPalette()

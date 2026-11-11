@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
 
 from mpq_editor.drag_drop import ErrorAction, handle_batch_error
 from mpq_editor.mpq_model import MPQModel
+from mpq_editor.path_utils import fold, is_under, relative_to, split_parts
+from mpq_editor.special import special_file_info
 
 
 class FileListWidget(QTreeWidget):
@@ -69,57 +71,48 @@ class FileListWidget(QTreeWidget):
             self.setUpdatesEnabled(True)
             return
         files = self.mpq_model.list_files()
-        prefix = self._current_dir.replace("/", "\\")
-        if prefix and not prefix.endswith("\\"):
-            prefix += "\\"
+        cur_fold = fold(self._current_dir)
+        cur_parts = split_parts(self._current_dir)
 
-        dirs_in_dir: set[str] = set()
+        # 子目录行：目录不区分大小写，dir_map 已合并为规范形式，行数据存完整路径
+        dir_map = self.mpq_model.dir_map()
+        dirs_in_dir: dict[str, str] = {}
+        for d in dir_map.values():
+            dparts = d.split("/")
+            if len(dparts) == len(cur_parts) + 1 and fold("/".join(dparts[:-1])) == cur_fold:
+                dirs_in_dir[fold(dparts[-1])] = d
+
+        # 文件行：按折叠大小写匹配当前目录
         files_in_dir: list[str] = []
-
         for f in files:
-            norm_f = f.replace("\\", "/")
-            if prefix:
-                if not norm_f.startswith(self._current_dir.replace("\\", "/") + "/"):
-                    continue
-                rel = norm_f[len(self._current_dir) + 1 :]
-            else:
-                rel = norm_f
-            if "/" in rel:
-                sub_dir = rel.split("/")[0]
-                dirs_in_dir.add(sub_dir)
-            elif rel:
+            fparts = split_parts(f)
+            if len(fparts) != len(cur_parts) + 1:
+                continue
+            if all(p.casefold() == q.casefold() for p, q in zip(fparts, cur_parts, strict=False)):
                 files_in_dir.append(f)
 
-        for d in self.mpq_model._empty_dirs:
-            norm_d = d.replace("\\", "/")
-            cur = self._current_dir.replace("\\", "/")
-            if cur:
-                if norm_d.startswith(cur + "/"):
-                    rel = norm_d[len(cur) + 1 :]
-                    if "/" in rel:
-                        dirs_in_dir.add(rel.split("/")[0])
-                    elif rel:
-                        dirs_in_dir.add(rel)
-            else:
-                if "/" in norm_d:
-                    dirs_in_dir.add(norm_d.split("/")[0])
-                elif norm_d:
-                    dirs_in_dir.add(norm_d)
-
-        for d in sorted(dirs_in_dir):
-            item = QTreeWidgetItem([d, "目录", ""])
+        for d in sorted(dirs_in_dir.values(), key=fold):
+            name = d.split("/")[-1]
+            item = QTreeWidgetItem([name, "目录", ""])
             item.setData(0, Qt.ItemDataRole.UserRole, "dir:" + d)
             item.setIcon(0, self._dir_icon)
             self.addTopLevelItem(item)
 
-        for f in sorted(files_in_dir):
+        for f in sorted(files_in_dir, key=fold):
             norm_f = f.replace("\\", "/")
             name = norm_f.split("/")[-1]
-            ext = Path(name).suffix.lower() if "." in name else ""
+            info = special_file_info(f)
+            if info is not None:
+                type_text = info.label
+            else:
+                ext = Path(name).suffix.lower() if "." in name else ""
+                type_text = f"文件 {ext}".rstrip()
             size = self._get_file_size(f)
-            item = QTreeWidgetItem([name, f"文件 {ext}", str(size)])
+            item = QTreeWidgetItem([name, type_text, str(size)])
             item.setData(0, Qt.ItemDataRole.UserRole, "file:" + f)
             item.setIcon(0, self._file_icon)
+            if info is not None:
+                item.setToolTip(1, info.description)
             self.addTopLevelItem(item)
         self.setUpdatesEnabled(True)
 
@@ -129,31 +122,40 @@ class FileListWidget(QTreeWidget):
     def _ensure_current_dir_valid(self):
         if not self._current_dir:
             return
-        prefix = self._current_dir.replace("\\", "/") + "/"
-        files = self.mpq_model.list_files()
-        if (
-            not any(
-                f.replace("\\", "/").startswith(prefix)
-                or f.replace("\\", "/") == self._current_dir.replace("\\", "/")
-                for f in files
-            )
-            and self._current_dir not in self.mpq_model._empty_dirs
-        ):
-            self._current_dir = "/".join(self._current_dir.split("/")[:-1])
+        while self._current_dir and not self.mpq_model.has_dir(self._current_dir):
+            parts = self._current_dir.split("/")
+            self._current_dir = "/".join(parts[:-1])
 
     def _on_double_click(self, item: QTreeWidgetItem, _column: int):
         user_data = item.data(0, Qt.ItemDataRole.UserRole)
         if user_data and user_data.startswith("dir:"):
-            dir_name = user_data[4:]
-            new_path = f"{self._current_dir}/{dir_name}" if self._current_dir else dir_name
-            self.current_dir = new_path
-            self.file_activated.emit(new_path)
+            dir_path = user_data[4:]
+            self.current_dir = dir_path
+            self.file_activated.emit(dir_path)
         elif user_data and user_data.startswith("file:"):
             file_path = user_data[5:]
+            info = special_file_info(file_path)
+            if info is not None and info.is_binary:
+                self._explain_binary_special(file_path, info)
+                return
             if file_path.lower().endswith(".dc6"):
                 self.dc6_file_activated.emit(file_path)
             else:
                 self._extract_single_file(file_path)
+
+    def _explain_binary_special(self, file_path: str, info) -> None:
+        """解释二进制内部文件为何显示乱码，并允许用户继续导出。"""
+        name = file_path.replace("\\", "/").split("/")[-1]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(name)
+        box.setText(f"{name} 是 {info.label}。")
+        box.setInformativeText(f"{info.description}\n\n如需原始数据，可选择“仍要导出”。")
+        extract_btn = box.addButton("仍要导出", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is extract_btn:
+            self._extract_single_file(file_path)
 
     def _extract_single_file(self, mpq_path: str):
         from PySide6.QtWidgets import QFileDialog
@@ -195,7 +197,9 @@ class FileListWidget(QTreeWidget):
         skip_all = False
         for item in items:
             user_data = item.data(0, Qt.ItemDataRole.UserRole)
-            if user_data and user_data.startswith("file:"):
+            if not user_data:
+                continue
+            if user_data.startswith("file:"):
                 mpq_path = user_data[5:]
                 try:
                     self.mpq_model.extract_file(mpq_path, dest)
@@ -204,14 +208,10 @@ class FileListWidget(QTreeWidget):
                     if action == ErrorAction.ABORT:
                         return
                     skip_all = action == ErrorAction.SKIP_ALL
-            elif user_data and user_data.startswith("dir:"):
-                dir_name = user_data[4:]
-                dir_path = (
-                    f"{self._current_dir}/{dir_name}".strip("/") if self._current_dir else dir_name
-                )
+            elif user_data.startswith("dir:"):
+                dir_path = user_data[4:]
                 for f in self.mpq_model.list_files():
-                    norm_f = f.replace("\\", "/")
-                    if norm_f.startswith(dir_path + "/") or norm_f == dir_path:
+                    if is_under(f, dir_path):
                         try:
                             self.mpq_model.extract_file(f, dest)
                         except Exception as e:
@@ -234,20 +234,14 @@ class FileListWidget(QTreeWidget):
             empty_dirs_to_remove: list[str] = []
             for item in items:
                 user_data = item.data(0, Qt.ItemDataRole.UserRole)
-                if user_data and user_data.startswith("file:"):
+                if not user_data:
+                    continue
+                if user_data.startswith("file:"):
                     to_delete.append(user_data[5:])
-                elif user_data and user_data.startswith("dir:"):
-                    dir_name = user_data[4:]
-                    dir_path = (
-                        f"{self._current_dir}/{dir_name}".strip("/")
-                        if self._current_dir
-                        else dir_name
-                    )
+                elif user_data.startswith("dir:"):
+                    dir_path = user_data[4:]
                     empty_dirs_to_remove.append(dir_path)
-                    for f in self.mpq_model.list_files():
-                        norm_f = f.replace("\\", "/")
-                        if norm_f.startswith(dir_path + "/") or norm_f == dir_path:
-                            to_delete.append(f)
+                    to_delete.extend(f for f in self.mpq_model.list_files() if is_under(f, dir_path))
 
             for mpq_path in to_delete:
                 try:
@@ -260,10 +254,10 @@ class FileListWidget(QTreeWidget):
 
             nav_up = False
             for dir_path in empty_dirs_to_remove:
-                self.mpq_model.remove_empty_dir(dir_path)
-                self.mpq_model.remove_empty_dir(self._current_dir)
+                self.mpq_model.remove_empty_dirs_under(dir_path)
                 if self._current_dir and (
-                    self._current_dir == dir_path or self._current_dir.startswith(dir_path + "/")
+                    fold(self._current_dir) == fold(dir_path)
+                    or is_under(self._current_dir, dir_path)
                 ):
                     nav_up = True
 
@@ -273,30 +267,37 @@ class FileListWidget(QTreeWidget):
 
     def _rename_item(self, item):
         user_data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not user_data:
+            return
         old_name = item.text(0)
         new_name, ok = QInputDialog.getText(self, "重命名", "新名称:", text=old_name)
-        if ok and new_name and new_name != old_name:
-            if user_data.startswith("file:"):
-                old_path = user_data[5:]
-                parts = old_path.replace("\\", "/").split("/")
-                parts[-1] = new_name
-                new_path = "/".join(parts)
-                self.mpq_model.rename_file(old_path, new_path)
-            elif user_data.startswith("dir:"):
-                old_dir = user_data[4:]
-                old_path = (
-                    f"{self._current_dir}/{old_dir}".strip("/") if self._current_dir else old_dir
-                )
-                new_path = (
-                    f"{self._current_dir}/{new_name}".strip("/") if self._current_dir else new_name
-                )
-                for f in self.mpq_model.list_files():
-                    if f.startswith(old_path.replace("/", "\\")) or f.startswith(old_path):
-                        rel = f[len(old_path) :]
-                        self.mpq_model.rename_file(f, new_path + rel)
-                if old_path in self.mpq_model._empty_dirs:
-                    self.mpq_model.rename_empty_dir(old_path, new_path)
-                self.refresh()
+        if not (ok and new_name and new_name != old_name):
+            return
+        if user_data.startswith("file:"):
+            old_path = user_data[5:]
+            sep = "\\" if "\\" in old_path else "/"
+            parts = old_path.replace("\\", "/").split("/")
+            parts[-1] = new_name
+            new_path = sep.join(parts)
+            self.mpq_model.rename_file(old_path, new_path)
+        elif user_data.startswith("dir:"):
+            old_path = user_data[4:]
+            parts = old_path.split("/")
+            parts[-1] = new_name
+            new_path = "/".join(parts)
+            for f in self.mpq_model.list_files():
+                rel = relative_to(f, old_path)
+                if not rel:
+                    continue
+                sep = "\\" if "\\" in f else "/"
+                self.mpq_model.rename_file(f, new_path.replace("/", sep) + sep + rel.replace("/", sep))
+            self.mpq_model.rename_empty_dir(old_path, new_path)
+            rel = relative_to(self._current_dir, old_path)
+            if fold(self._current_dir) == fold(old_path):
+                self._current_dir = new_path
+            elif rel is not None:
+                self._current_dir = new_path + "/" + rel
+            self.refresh()
 
     def _new_dir(self):
         from mpq_editor.dialogs import NewDirDialog
@@ -340,31 +341,25 @@ class FileListWidget(QTreeWidget):
                         return
                     skip_all = action == ErrorAction.SKIP_ALL
             elif user_data.startswith("dir:"):
-                dir_name = user_data[4:]
-                extract_dir = Path(tmp_dir) / dir_name
+                dir_path = user_data[4:]
+                extract_dir = Path(tmp_dir) / dir_path.split("/")[-1]
                 extract_dir.mkdir(parents=True, exist_ok=True)
-                prefix = (
-                    (self._current_dir + "/" + dir_name).replace("\\", "/")
-                    if self._current_dir
-                    else dir_name
-                )
                 for f in self.mpq_model.list_files():
-                    norm_f = f.replace("\\", "/")
-                    if norm_f.startswith(prefix + "/") or norm_f == prefix:
-                        rel = norm_f[len(prefix) + 1 :] if norm_f != prefix else ""
-                        if rel:
-                            try:
-                                target = extract_dir / rel
-                                target.parent.mkdir(parents=True, exist_ok=True)
-                                assert self.mpq_model._mpq is not None
-                                data = self.mpq_model._mpq.read_file(f)
-                                target.write_bytes(data)
-                            except Exception as e:
-                                action = handle_batch_error(self, f, e, skip_all)
-                                if action == ErrorAction.ABORT:
-                                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                                    return
-                                skip_all = action == ErrorAction.SKIP_ALL
+                    rel = relative_to(f, dir_path)
+                    if not rel:
+                        continue
+                    try:
+                        target = extract_dir / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        assert self.mpq_model._mpq is not None
+                        data = self.mpq_model._mpq.read_file(f)
+                        target.write_bytes(data)
+                    except Exception as e:
+                        action = handle_batch_error(self, f, e, skip_all)
+                        if action == ErrorAction.ABORT:
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                            return
+                        skip_all = action == ErrorAction.SKIP_ALL
                 urls.append(QUrl.fromLocalFile(str(extract_dir)))
 
         if not urls:

@@ -8,7 +8,6 @@ from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
-    QHeaderView,
     QInputDialog,
     QMenu,
     QMessageBox,
@@ -20,6 +19,7 @@ from PySide6.QtWidgets import (
 from mpq_editor.dialogs import NewDirDialog
 from mpq_editor.drag_drop import ErrorAction, handle_batch_error
 from mpq_editor.mpq_model import MPQModel
+from mpq_editor.path_utils import fold, is_under, relative_to, sort_key
 
 
 class TreeWidget(QTreeWidget):
@@ -54,17 +54,9 @@ class TreeWidget(QTreeWidget):
         if not self.mpq_model.is_open:
             self.setUpdatesEnabled(True)
             return
-        files = self.mpq_model.list_files()
 
-        dirs: set[str] = set()
-        for f in files:
-            parts = f.replace("\\", "/").split("/")
-            for i in range(1, len(parts)):
-                dirs.add("/".join(parts[:i]))
-        for d in self.mpq_model._empty_dirs:
-            parts = d.replace("\\", "/").split("/")
-            for i in range(1, len(parts) + 1):
-                dirs.add("/".join(parts[:i]))
+        # 目录不区分大小写：dir_map 已把仅大小写不同的目录合并为一个规范形式
+        dirs = sorted(self.mpq_model.dir_map().values(), key=sort_key)
 
         mpq_name = self.mpq_model.file_path.name if self.mpq_model.file_path else "MPQ"
         root_item = QTreeWidgetItem([mpq_name])
@@ -72,17 +64,16 @@ class TreeWidget(QTreeWidget):
         root_item.setIcon(0, self._dir_icon)
         self.addTopLevelItem(root_item)
 
-        added: dict[str, QTreeWidgetItem] = {"": root_item}
-        sorted_dirs = sorted(dirs, key=lambda d: (d.count("/"), d))
-        for d in sorted_dirs:
+        added: dict[str, QTreeWidgetItem] = {fold(""): root_item}
+        for d in dirs:
             parts = d.split("/")
-            parent_d = "/".join(parts[:-1])
-            parent_item = added.get(parent_d, root_item)
+            parent_fold = fold("/".join(parts[:-1]))
+            parent_item = added.get(parent_fold, root_item)
             item = QTreeWidgetItem([parts[-1]])
             item.setData(0, Qt.ItemDataRole.UserRole, d)
             item.setIcon(0, self._dir_icon)
             parent_item.addChild(item)
-            added[d] = item
+            added[fold(d)] = item
 
         self._restore_expanded_state(expanded_paths, added)
         root_item.setExpanded(True)
@@ -99,7 +90,7 @@ class TreeWidget(QTreeWidget):
         def walk(item):
             path = item.data(0, Qt.ItemDataRole.UserRole)
             if path is not None and item.isExpanded():
-                paths.add(path)
+                paths.add(fold(path))
             for i in range(item.childCount()):
                 walk(item.child(i))
 
@@ -127,14 +118,14 @@ class TreeWidget(QTreeWidget):
                 return parent_item
             for i in range(parent_item.childCount()):
                 child = parent_item.child(i)
-                if child.text(0) == parts[idx]:
+                if child.text(0).casefold() == parts[idx].casefold():
                     return find(child, parts, idx + 1)
             return parent_item
 
         if not path:
             self.setCurrentItem(root)
             return
-        parts = path.split("/")
+        parts = [p for p in path.replace("\\", "/").split("/") if p]
         item = find(root, parts)
         if item and item != root:
             self.setCurrentItem(item)
@@ -175,6 +166,9 @@ class TreeWidget(QTreeWidget):
             if action == new_dir_act:
                 self._new_dir("")
 
+    def _files_under(self, dir_path: str) -> list[str]:
+        return [f for f in self.mpq_model.list_files() if is_under(f, dir_path)]
+
     def _extract_dir(self, dir_path: str):
         from PySide6.QtWidgets import QFileDialog
 
@@ -182,52 +176,53 @@ class TreeWidget(QTreeWidget):
         if not dest:
             return
         skip_all = False
-        for f in self.mpq_model.list_files():
-            if f.startswith(dir_path) or f.startswith(dir_path.replace("/", "\\")):
-                try:
-                    self.mpq_model.extract_file(f, dest)
-                except Exception as e:
-                    action = handle_batch_error(self, f, e, skip_all)
-                    if action == ErrorAction.ABORT:
-                        return
-                    skip_all = action == ErrorAction.SKIP_ALL
+        for f in self._files_under(dir_path):
+            try:
+                self.mpq_model.extract_file(f, dest)
+            except Exception as e:
+                action = handle_batch_error(self, f, e, skip_all)
+                if action == ErrorAction.ABORT:
+                    return
+                skip_all = action == ErrorAction.SKIP_ALL
 
     def _delete_dir(self, dir_path: str):
         reply = QMessageBox.question(
             self,
             "确认删除",
-            f"确定要删除目录 '{dir_path}' 及其所有文件？",
+            f"确定要删除目录 '{dir_path or '/'}' 及其所有文件？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             skip_all = False
-            for f in self.mpq_model.list_files():
-                if f.startswith(dir_path) or f.startswith(dir_path.replace("/", "\\")):
-                    try:
-                        self.mpq_model.delete_file(f)
-                    except Exception as e:
-                        action = handle_batch_error(self, f, e, skip_all)
-                        if action == ErrorAction.ABORT:
-                            return
-                        skip_all = action == ErrorAction.SKIP_ALL
+            for f in self._files_under(dir_path):
+                try:
+                    self.mpq_model.delete_file(f)
+                except Exception as e:
+                    action = handle_batch_error(self, f, e, skip_all)
+                    if action == ErrorAction.ABORT:
+                        return
+                    skip_all = action == ErrorAction.SKIP_ALL
+            self.mpq_model.remove_empty_dirs_under(dir_path)
             self.refresh()
 
     def _rename_dir(self, dir_path: str):
-        new_name, ok = QInputDialog.getText(
-            self, "重命名", "新目录名:", text=dir_path.split("/")[-1]
-        )
-        if ok and new_name:
-            parts = dir_path.split("/")
-            parts[-1] = new_name
-            new_path = "/".join(parts)
-            for f in self.mpq_model.list_files():
-                if f.startswith(dir_path.replace("/", "\\")) or f.startswith(dir_path):
-                    rel = f[len(dir_path) :]
-                    new_f = new_path + rel
-                    self.mpq_model.rename_file(f, new_f)
-            if dir_path in self.mpq_model._empty_dirs:
-                self.mpq_model.rename_empty_dir(dir_path, new_path)
-            self.refresh()
+        if not dir_path:
+            QMessageBox.information(self, "重命名", "不能重命名档案根目录。")
+            return
+        new_name, ok = QInputDialog.getText(self, "重命名", "新目录名:", text=dir_path.split("/")[-1])
+        if not (ok and new_name):
+            return
+        parts = dir_path.replace("\\", "/").split("/")
+        parts[-1] = new_name
+        new_path = "/".join(parts)
+        for f in self._files_under(dir_path):
+            rel = relative_to(f, dir_path)
+            if not rel:
+                continue
+            sep = "\\" if "\\" in f else "/"
+            self.mpq_model.rename_file(f, new_path.replace("/", sep) + sep + rel.replace("/", sep))
+        self.mpq_model.rename_empty_dir(dir_path, new_path)
+        self.refresh()
 
     def _new_dir(self, base_path: str):
         dlg = NewDirDialog(self, base_path)
@@ -242,7 +237,7 @@ class TreeWidget(QTreeWidget):
         item = self.currentItem()
         if not item:
             return
-        dir_path = item.data(0, Qt.ItemDataRole.UserRole)
+        dir_path = item.data(0, Qt.ItemDataRole.UserRole) or ""
 
         import shutil
         import tempfile
@@ -251,17 +246,10 @@ class TreeWidget(QTreeWidget):
 
         skip_all = False
         targets = []
-        for f in self.mpq_model.list_files():
-            norm_f = f.replace("\\", "/")
-            if dir_path == "":
-                if "/" in norm_f:
-                    continue
-                rel = norm_f
-            else:
-                if not norm_f.startswith(dir_path + "/"):
-                    continue
-                rel = norm_f[len(dir_path) + 1 :]
-            targets.append((f, rel))
+        for f in self._files_under(dir_path):
+            rel = relative_to(f, dir_path)
+            if rel:
+                targets.append((f, rel))
 
         assert self.mpq_model.file_path is not None
         extract_dir = Path(tmp_dir) / (
