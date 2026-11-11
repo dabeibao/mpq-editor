@@ -350,7 +350,7 @@ class TestDither:
         for y in range(8):
             for x in range(8):
                 idx = dithered.pixelIndex(x, y)
-                assert 0 <= idx < 256
+                assert 0 <= idx <= 224  # 导入量化的索引上限，见 dc6/model.py
 
     def test_dither_full_ratio(self):
         palette = load_palette("act1")
@@ -368,6 +368,18 @@ class TestDither:
         dithered = floyd_steinberg_dither(img, palette, 200.0)
         assert dithered.width() == 4
         assert dithered.height() == 4
+
+    @pytest.mark.parametrize("ratio", [0.0, 100.0, 200.0])
+    @pytest.mark.parametrize("preserve_black", [False, True])
+    def test_dither_never_exceeds_224(self, ratio: float, preserve_black: bool):
+        """白色底最容易诱出 255 号，任何误差比例/开关组合都不能越界。"""
+        img = QImage(8, 8, QImage.Format.Format_ARGB32)
+        img.fill(QColor(255, 255, 255, 255).rgba())
+        dithered = floyd_steinberg_dither(
+            img, load_palette("act1"), ratio, preserve_black=preserve_black
+        )
+        indices = [dithered.pixelIndex(x, y) for y in range(8) for x in range(8)]
+        assert max(indices) <= 224
 
 
 class TestSplitImageTiles:

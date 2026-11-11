@@ -20,14 +20,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-SETTINGS_PATH = str(Path(__file__).parent / "settings.ini")
-
 from dc6.dc6_viewer import Dc6PreviewPanel, Dc6Viewer
 from mpq_editor.dialogs import EncodingDialog, OpenOptionsDialog
 from mpq_editor.drag_drop import ErrorAction, handle_batch_error
 from mpq_editor.file_list_widget import FileListWidget
 from mpq_editor.mpq_model import MPQModel
 from mpq_editor.tree_widget import TreeWidget
+
+SETTINGS_PATH = str(Path(__file__).parent / "settings.ini")
 
 
 class MainWindow(QMainWindow):

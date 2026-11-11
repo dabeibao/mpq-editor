@@ -23,6 +23,16 @@ MAX_FRAME_SIZE = 256
 OFFSET_MIN = -(2**31)
 OFFSET_MAX = 2**31 - 1
 
+# D2 调色板是 256 个条目（.pal 文件 768 字节）：0 号是透明色，255 号是纯白。
+# 但只有 1..224 这 224 个颜色各 Act 通用，225..254 由各 Act 自行定义
+# （units.pal 里整段留空为黑）。导入时所有分支一律只生成 0..224 号索引：
+# 任何大于 224 的索引（含 255 白）都可能让图片换个 Act 就显示成杂色。
+PALETTE_ENTRIES = 256
+TRANSPARENT_INDEX = 0
+COMMON_COLOR_FIRST = 1
+COMMON_COLOR_LAST = 224
+COMMON_COLOR_INDICES = tuple(range(COMMON_COLOR_FIRST, COMMON_COLOR_LAST + 1))
+
 
 @dataclass
 class FrameInfo:
@@ -329,15 +339,30 @@ def make_bmp_data(frame: FrameInfo, palette: bytes) -> bytes:
     return bytes(out)
 
 
+@lru_cache(maxsize=8)
+def _quantization_indices(count: int, *, skip_transparent: bool) -> tuple[int, ...]:
+    """导入时允许使用的索引：0..224（0 号仅用于透明点）；组合极少，可整段缓存。"""
+    end = min(COMMON_COLOR_LAST + 1, count)
+    indices = tuple(range(1 if skip_transparent and count > 1 else 0, end))
+    return indices or (TRANSPARENT_INDEX,)
+
+
 @lru_cache(maxsize=65536)
-def nearest_palette_index(r: int, g: int, b: int, palette: bytes) -> int:
-    """在调色板里找欧氏距离最近的颜色索引。
+def nearest_palette_index(
+    r: int, g: int, b: int, palette: bytes, *, skip_transparent: bool = False
+) -> int:
+    """在 0..224 号通用索引里找欧氏距离最近的颜色。
 
     结果与逐像素暴力搜索完全一致；缓存让大面积同色图片（精灵图）避免重复计算。
+    225..254 是 Act 专属色、255 是纯白，导入时都不参与量化，因此不存在能生成
+    大于 224 号索引的分支。``skip_transparent=True`` 再从 1..224 里选，让黑色这类
+    可见颜色不被 0 号透明色挖空。
     """
-    best_idx = 0
+    count = min(len(palette) // 3, PALETTE_ENTRIES)
+    indices = _quantization_indices(count, skip_transparent=skip_transparent)
+    best_idx = indices[0]
     best_dist = 3 * 256 * 256
-    for i in range(min(len(palette) // 3, 256)):
+    for i in indices:
         pr, pg, pb = palette_rgb(palette, i)
         dr = r - pr
         dg = g - pg
@@ -349,7 +374,17 @@ def nearest_palette_index(r: int, g: int, b: int, palette: bytes) -> int:
     return best_idx
 
 
-def floyd_steinberg_dither(img: QImage, palette: bytes, ratio: float) -> QImage:
+def floyd_steinberg_dither(
+    img: QImage, palette: bytes, ratio: float, *, preserve_black: bool = False
+) -> QImage:
+    """把图片量化成 Indexed8。
+
+    无论是否开启 ``preserve_black``，颜色量化都只在 0..224 号索引里进行：
+    225..254 是 Act 专属色、255 是纯白，导入时一律不用，避免换 Act 变色。
+    ``preserve_black=True`` 时：alpha=0 的像素直接写 0 号透明色且不参与误差扩散，
+    其余可见像素（含纯黑）从 1..224 里找最近色，因此黑色不会被挖空。
+    默认 False 保持历史行为：只看 RGB，纯黑自然落到同样是黑色的 0 号色。
+    """
     w, h = img.width(), img.height()
     ratio = max(0.0, min(2.0, ratio / 100.0))
 
@@ -367,6 +402,11 @@ def floyd_steinberg_dither(img: QImage, palette: bytes, ratio: float) -> QImage:
     for y in range(h):
         for x in range(w):
             pixel = img_rgba.pixel(x, y)
+            # 透明点既不做颜色量化，也不把误差扩散给邻居，避免透明区域边缘出现色晕。
+            if preserve_black and ((pixel >> 24) & 0xFF) == 0:
+                out.setPixel(x, y, 0)
+                continue
+
             orig_r = (pixel >> 16) & 0xFF
             orig_g = (pixel >> 8) & 0xFF
             orig_b = pixel & 0xFF
@@ -379,7 +419,7 @@ def floyd_steinberg_dither(img: QImage, palette: bytes, ratio: float) -> QImage:
             g = max(0, min(255, int(g + 0.5)))
             b = max(0, min(255, int(b + 0.5)))
 
-            best_idx = nearest_palette_index(r, g, b, palette)
+            best_idx = nearest_palette_index(r, g, b, palette, skip_transparent=preserve_black)
             out.setPixel(x, y, best_idx)
 
             pr, pg, pb = palette_rgb(palette, best_idx)

@@ -12,6 +12,7 @@ from typing import cast
 from PySide6.QtGui import QImage
 
 from dc6.model import (
+    COMMON_COLOR_LAST,
     MAX_FRAME_SIZE,
     OFFSET_MAX,
     OFFSET_MIN,
@@ -109,11 +110,15 @@ def frames_from_image(
     frames_per_row: int = 1,
     *,
     allow_split: bool = True,
+    preserve_black: bool = False,
 ) -> list[FrameInfo]:
     """把一张普通图片转成一帧或多帧 DC6 数据。
 
     - allow_split=True：宽或高超过 256 时按 frames_per_row 拆成多帧。
     - allow_split=False：用于「替换」，超过 256 直接抛 FrameSizeError。
+    - 所有分支生成的颜色索引都不超过 224（0 号透明 + 1..224 通用色）。
+    - preserve_black=True：仅 alpha=0 的像素使用 0 号透明色，其余可见像素
+      （含纯黑）从 1..224 里取最近色，黑色保持可见。
     """
     if img.isNull():
         raise FrameSizeError("无法读取图片")
@@ -124,7 +129,7 @@ def frames_from_image(
             f"当前图片为 {img.width()}x{img.height()}"
         )
 
-    dithered = floyd_steinberg_dither(img, palette, ratio)
+    dithered = floyd_steinberg_dither(img, palette, ratio, preserve_black=preserve_black)
     if need_split:
         tiles = split_image_tiles(dithered, frames_per_row)
     else:
@@ -133,6 +138,10 @@ def frames_from_image(
     frames = frames_from_tiles(tiles)
     for frame in frames:
         validate_frame_size(frame.width, frame.height)
+        # 最后一道锁：量化正常时不会触发，但将来若有人放宽索引范围，这里会立刻报错，
+        # 而不是静默产出换个 Act 就变色的帧数据。
+        if max(frame.pixels, default=0) > COMMON_COLOR_LAST:
+            raise ValueError(f"导入结果包含超过 {COMMON_COLOR_LAST} 的调色板索引")
     return frames
 
 

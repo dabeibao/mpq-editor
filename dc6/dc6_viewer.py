@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
-from typing import override
+from typing import NamedTuple, override
 
 # 兼容直接执行 `python dc6/dc6_viewer.py` 的情况。
 if not __package__:  # pragma: no cover - 仅脚本直跑时生效
@@ -154,6 +155,8 @@ __all__ = [
 
 THUMB_HEIGHT = 40
 THUMB_WIDTH = 60
+# 导入选项存到 QSettings；用字符串而非 bool，避免不同平台把 "false" 读成真值。
+PRESERVE_BLACK_KEY = "import/preserve_black"
 
 
 class OffsetDelegate(QStyledItemDelegate):
@@ -388,13 +391,35 @@ class ExportDialog(QDialog):
         )
 
 
+class ImportSettings(NamedTuple):
+    """导入对话框的参数集合。
+
+    用具名字段承载选项，避免以后每加一个开关就多一个靠位置区分的 tuple 元素。
+    同时保留 tuple 行为（可解包、可按下标访问），兼容既有调用。
+    """
+
+    palette: str
+    ratio: float
+    frames_per_row: int
+    preserve_black: bool = False
+
+
+class _SwitchDecision(Enum):
+    """切换文档前，用户对「未保存的修改」所作的选择。"""
+
+    PROCEED = "proceed"  # 没有修改，或已经保存成功
+    DISCARD = "discard"  # 放弃修改，继续切换
+    CANCEL = "cancel"  # 留在当前文档
+
+
 class ImportDialog(QDialog):
-    """选择图片、调色板、抖动误差比例；大图时配置每行帧数。"""
+    """选择图片、调色板、抖动误差比例、透明处理方式；大图时配置每行帧数。"""
 
     allow_split: bool
     need_split: bool
     palette_combo: QComboBox
     ratio_spin: QSpinBox
+    black_cb: QCheckBox
     fpr_widget: QWidget
     fpr_spin: QSpinBox
     fpr_info: QLabel
@@ -409,6 +434,7 @@ class ImportDialog(QDialog):
         *,
         allow_split: bool = True,
         title: str = "导入图片",
+        preserve_black: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -448,6 +474,16 @@ class ImportDialog(QDialog):
         ratio_layout.addWidget(self.ratio_spin)
         layout.addLayout(ratio_layout)
 
+        self.black_cb = QCheckBox("保留黑色：仅透明像素使用透明色 (pal 0)")
+        self.black_cb.setToolTip(
+            "勾选后，调色板 0 号色只用于源图完全透明 (alpha=0) 的像素；"
+            "黑色等可见颜色改用 1..224 的 224 个跨 Act 通用色，不会被当成背景挖空。"
+            "所有导入都只生成不超过 224 的索引，避免换 Act 显示成杂色。"
+            "此选项会记住上次的选择。"
+        )
+        self.black_cb.setChecked(preserve_black)
+        layout.addWidget(self.black_cb)
+
         self.fpr_widget = QWidget()
         fpr_layout = QHBoxLayout(self.fpr_widget)
         fpr_layout.setContentsMargins(0, 0, 0, 0)
@@ -478,11 +514,12 @@ class ImportDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
 
-    def settings(self) -> tuple[str, float, int]:
-        return (
-            self.palette_combo.currentText(),
-            float(self.ratio_spin.value()),
-            self.fpr_spin.value() if self.need_split and self.allow_split else 0,
+    def settings(self) -> ImportSettings:
+        return ImportSettings(
+            palette=self.palette_combo.currentText(),
+            ratio=float(self.ratio_spin.value()),
+            frames_per_row=self.fpr_spin.value() if self.need_split and self.allow_split else 0,
+            preserve_black=self.black_cb.isChecked(),
         )
 
 
@@ -604,6 +641,8 @@ class Dc6Viewer(QMainWindow):
     # 类级注解让静态检查器明确这些属性的类型（均由 __init__ / _setup_* 赋值）。
     _dc6: Dc6File | None
     _source_path: str | None
+    # 从 MPQ 内部打开时 source_path 是归档里的虚拟路径，不能直接写盘。
+    _source_is_virtual: bool
     _current_frame: int
     _modified: bool
     _is_dark: bool
@@ -641,6 +680,7 @@ class Dc6Viewer(QMainWindow):
         self._is_dark = is_dark
         self._dc6 = None
         self._source_path = source_path
+        self._source_is_virtual = False
         self._current_frame = -1
         self._modified = False
         self._settings = QSettings("MPQEditor", "DC6Viewer")
@@ -913,6 +953,10 @@ class Dc6Viewer(QMainWindow):
         """QSettings.value 的静态类型是 object，这里统一收敛成 str。"""
         return str(self._settings.value(key, ""))
 
+    def _remembered_preserve_black(self) -> bool:
+        """读取上次导入时确定的「保留黑色」选项。"""
+        return str(self._settings.value(PRESERVE_BLACK_KEY, "false")) == "true"
+
     # ------------------------------------------------------------- 状态刷新
     def _refresh_title(self):
         name = Path(self._source_path).name if self._source_path else "未命名"
@@ -983,64 +1027,111 @@ class Dc6Viewer(QMainWindow):
             self.palette_combo.setCurrentIndex(idx)
 
     # ------------------------------------------------------------- 文件操作
+    def _confirm_before_switch(self) -> _SwitchDecision:
+        """新建 / 打开 / 切换文件前，确认当前文档未保存的修改。
+
+        DISCARD 时由调用方在真正替换文档时清掉修改标记；CANCEL 时必须保持现状。
+        选择「是」但保存失败（例如另存为被取消）同样视为 CANCEL，避免丢失修改。
+        """
+        if not self._modified:
+            return _SwitchDecision.PROCEED
+        name = Path(self._source_path).name if self._source_path else "未命名"
+        buttons = (
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel
+        )
+        choice = QMessageBox.question(
+            self,
+            "未保存的修改",
+            f"{name} 有未保存的修改，切换前是否保存？",
+            buttons,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            return _SwitchDecision.PROCEED if self._save() else _SwitchDecision.CANCEL
+        if choice == QMessageBox.StandardButton.No:
+            return _SwitchDecision.DISCARD
+        return _SwitchDecision.CANCEL
+
     def _new_dc6(self):
+        if self._confirm_before_switch() is _SwitchDecision.CANCEL:
+            return
         self._dc6 = Dc6File.blank()
         self._source_path = None
+        self._source_is_virtual = False
         self._current_frame = -1
         self._modified = False
         self._populate_palettes()
         self._reload_frames(message="已创建空白 DC6，右键帧列表可插入图像")
 
-    def _save(self):
+    def _save(self) -> bool:
+        """保存当前文档；返回是否真的写入成功（切换文件时需要据此决定是否放行）。"""
         if not self._dc6:
-            return
+            return False
         if not self._dc6.frames:
             QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先插入帧")
-            return
-        if self._source_path:
-            try:
-                self._write_dc6(self._source_path)
-                self._modified = False
-                self._refresh_title()
-                self.statusBar().showMessage(f"已保存: {self._source_path}")
-            except OSError as e:
-                QMessageBox.critical(self, "保存失败", str(e))
-        else:
-            self._save_as()
+            return False
+        if not self._source_path or self._source_is_virtual:
+            return self._save_as()
+        try:
+            self._write_dc6(self._source_path)
+        except OSError as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+            return False
+        self._modified = False
+        self._refresh_title()
+        self.statusBar().showMessage(f"已保存: {self._source_path}")
+        return True
 
-    def _save_as(self):
+    def _save_as(self) -> bool:
         if not self._dc6:
-            return
+            return False
         if not self._dc6.frames:
             QMessageBox.warning(self, "保存失败", "无法保存空白 DC6，请先插入帧")
-            return
+            return False
         path, _ = QFileDialog.getSaveFileName(self, "另存为 DC6", "", "DC6 文件 (*.dc6);;所有文件 (*)")
-        if path:
-            try:
-                self._write_dc6(path)
-                self._source_path = path
-                self._modified = False
-                self._refresh_title()
-                self.statusBar().showMessage(f"已保存: {path}")
-            except OSError as e:
-                QMessageBox.critical(self, "保存失败", str(e))
+        if not path:
+            return False
+        try:
+            self._write_dc6(path)
+        except OSError as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+            return False
+        self._source_path = path
+        self._source_is_virtual = False
+        self._modified = False
+        self._refresh_title()
+        self.statusBar().showMessage(f"已保存: {path}")
+        return True
 
     def _write_dc6(self, path: str):
         if not self._dc6:
             return
         Path(path).write_bytes(build_dc6_bytes(self._dc6))
 
-    def load_data(self, data: bytes, source_path: str | None = None):
+    def load_data(self, data: bytes, source_path: str | None = None) -> bool:
+        """加载并显示另一个 DC6；返回是否真的切换了文档。
+
+        所有会替换当前文档的入口（打开文件、文件列表、MPQ 编辑器双击）都经过这里，
+        因此未保存修改的确认只需在这一处收口。
+        """
+        if self._confirm_before_switch() is _SwitchDecision.CANCEL:
+            return False
         try:
-            self._dc6 = Dc6File(data)
+            dc6 = Dc6File(data)
+            self._dc6 = dc6
             self._source_path = source_path
+            self._source_is_virtual = source_path is not None and not Path(source_path).is_file()
             self._current_frame = 0
             self._modified = False
             self._populate_palettes()
             self._reload_frames(message=f"已加载: {Path(source_path).name if source_path else 'untitled'} "
-                                        f"({self._dc6.total_frames()} 帧)")
+                                        f"({dc6.total_frames()} 帧)")
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
+            return False
+        return True
 
     def _populate_palettes(self):
         self.palette_combo.blockSignals(True)
@@ -1071,38 +1162,73 @@ class Dc6Viewer(QMainWindow):
         self.file_list.verticalScrollBar().setValue(scroll_pos)
 
     def _on_file_list_selected(
-        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
+        self, current: QListWidgetItem | None, previous: QListWidgetItem | None
     ):
         if current is None:
             return
-        path = current.data(Qt.ItemDataRole.UserRole)
-        if path and Path(path).is_file():
-            try:
-                self.load_data(Path(path).read_bytes(), path)
-            except OSError as e:
-                self.statusBar().showMessage(f"打开失败: {e}")
+        path = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        if not path or not Path(path).is_file():
+            return
+        try:
+            data = Path(path).read_bytes()
+        except OSError as e:
+            self.statusBar().showMessage(f"打开失败: {e}")
+            return
+        if self.load_data(data, path):
+            return
+        # 取消切换或打开失败时还原高亮，避免左侧列表与实际显示的文档不一致。
+        self.file_list.blockSignals(True)
+        if previous is None:
+            self.file_list.setCurrentRow(-1)
+        else:
+            self.file_list.setCurrentItem(previous)
+        self.file_list.blockSignals(False)
 
     def _open_directory(self):
         last_dir = self._last_dir("last_open_dir")
         directory = QFileDialog.getExistingDirectory(self, "打开 DC6 目录", last_dir)
-        if directory:
-            self._settings.setValue("last_open_dir", directory)
-            self._populate_file_list(directory)
-            if self.file_list.count() > 0:
-                self.file_list.setCurrentRow(0)
+        if not directory:
+            return
+        # 刷新列表后会自动选中第一个文件（等于切换文档），先确认未保存的修改。
+        decision = self._confirm_before_switch()
+        if decision is _SwitchDecision.CANCEL:
+            return
+        self._settings.setValue("last_open_dir", directory)
+        self._populate_file_list(directory)
+        first_item = self.file_list.item(0)
+        if first_item is None:
+            return
+        # 显式加载第一个文件：若当前文件正好就在目录里，setCurrentRow(0) 不会发出
+        # 切换信号，靠信号加载会让「放弃修改」只改了标记、内存里仍留着旧改动。
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(0)
+        self.file_list.blockSignals(False)
+        if decision is _SwitchDecision.DISCARD:
+            self._modified = False
+            self._refresh_title()
+        path = str(first_item.data(Qt.ItemDataRole.UserRole) or "")
+        try:
+            data = Path(path).read_bytes()
+        except OSError as e:
+            self.statusBar().showMessage(f"打开失败: {e}")
+            return
+        self.load_data(data, path)
 
     def _open_file(self):
         last_dir = self._last_dir("last_open_dir")
         path, _ = QFileDialog.getOpenFileName(
             self, "打开 DC6 文件", last_dir, "DC6 文件 (*.dc6);;所有文件 (*)"
         )
-        if path:
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()
+        except OSError as e:
+            QMessageBox.critical(self, "打开失败", str(e))
+            return
+        if self.load_data(data, path):
             self._settings.setValue("last_open_dir", str(Path(path).parent))
-            try:
-                self.load_data(Path(path).read_bytes(), path)
-                self.file_list.clearSelection()
-            except OSError as e:
-                QMessageBox.critical(self, "打开失败", str(e))
+            self.file_list.clearSelection()
 
     # ------------------------------------------------------------- 帧编辑
     def _choose_image_frames(self, allow_split: bool) -> tuple[list[FrameInfo], str] | None:
@@ -1139,13 +1265,16 @@ class Dc6Viewer(QMainWindow):
             self,
             allow_split=allow_split,
             title=title,
+            preserve_black=self._remembered_preserve_black(),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
 
-        pal_name, ratio, fpr = dlg.settings()
+        opts = dlg.settings()
+        # 只在确认导入后记住，点「取消」不应改变用户的长期偏好。
+        self._settings.setValue(PRESERVE_BLACK_KEY, "true" if opts.preserve_black else "false")
         try:
-            palette_data = load_palette(pal_name)
+            palette_data = load_palette(opts.palette)
         except (OSError, ValueError) as e:
             QMessageBox.critical(self, "调色板错误", str(e))
             return None
@@ -1153,14 +1282,21 @@ class Dc6Viewer(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.statusBar().showMessage("正在转换图像，请稍候...")
         try:
-            frames = frames_from_image(img, palette_data, ratio, fpr, allow_split=allow_split)
+            frames = frames_from_image(
+                img,
+                palette_data,
+                opts.ratio,
+                opts.frames_per_row,
+                allow_split=allow_split,
+                preserve_black=opts.preserve_black,
+            )
         except ValueError as e:
             QMessageBox.critical(self, "图像错误", str(e))
             return None
         finally:
             QApplication.restoreOverrideCursor()
 
-        return frames, pal_name
+        return frames, opts.palette
 
     def _insert_frames_at(self, position: int) -> None:
         dc6 = self._dc6

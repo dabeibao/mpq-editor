@@ -31,15 +31,21 @@ from dc6.frame_ops import (
     validate_offset,
 )
 from dc6.model import (
+    COMMON_COLOR_INDICES,
+    COMMON_COLOR_LAST,
     MAX_FRAME_SIZE,
     OFFSET_MAX,
     OFFSET_MIN,
+    PALETTE_ENTRIES,
+    TRANSPARENT_INDEX,
     Dc6File,
     FrameInfo,
     build_dc6_bytes,
+    list_palettes,
     load_palette,
     make_bmp_data,
     nearest_palette_index,
+    palette_rgb,
     plan_tiles,
 )
 
@@ -279,12 +285,235 @@ class TestImageConversion:
         palette = load_palette("act1")
         for r, g, b in [(0, 0, 0), (255, 255, 255), (100, 80, 60)]:
             best_idx, best_dist = 0, 3 * 256 * 256
-            for i in range(256):
+            for i in range(COMMON_COLOR_LAST + 1):
                 pr, pg, pb = palette[i * 3 + 2], palette[i * 3 + 1], palette[i * 3]
                 dist = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
                 if dist < best_dist:
                     best_dist, best_idx = dist, i
             assert nearest_palette_index(r, g, b, palette) == best_idx
+
+
+# ---------------------------------------------------------------------------
+# 调色板颜色范围：所有导入分支的索引都不超过 224
+# ---------------------------------------------------------------------------
+def _color_distance(palette: bytes, index: int, r: int, g: int, b: int) -> int:
+    pr, pg, pb = palette_rgb(palette, index)
+    return (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
+
+
+class TestPaletteRange:
+    def test_bundled_palettes_have_256_entries(self):
+        for name in list_palettes():
+            assert len(load_palette(name)) == PALETTE_ENTRIES * 3
+
+    def test_common_colors_are_exactly_224(self):
+        assert len(COMMON_COLOR_INDICES) == 224
+        assert COMMON_COLOR_INDICES[0] == 1
+        assert COMMON_COLOR_INDICES[-1] == 224
+        assert TRANSPARENT_INDEX not in COMMON_COLOR_INDICES
+
+    def test_units_palette_leaves_act_colors_unused(self):
+        units = load_palette("units")
+        assert all(palette_rgb(units, i) == (0, 0, 0) for i in range(225, 255))
+        assert palette_rgb(units, 255) == (255, 255, 255)  # 文件里有白，但导入不用
+        # 同样的索引在 Act 调色板里是彩色，故不能用于跨 Act 的图标。
+        act1 = load_palette("act1")
+        assert any(palette_rgb(act1, i) != (0, 0, 0) for i in range(225, 255))
+
+    def test_quantization_never_exceeds_224(self):
+        """每个内置调色板、每种开关组合、每种颜色都不得返回 >224 的索引。"""
+        colors = ((0, 0, 0), (255, 255, 255), (128, 64, 32), (200, 10, 240), (8, 20, 16))
+        for name in list_palettes():
+            palette = load_palette(name)
+            for r, g, b in colors:
+                for skip in (False, True):
+                    idx = nearest_palette_index(r, g, b, palette, skip_transparent=skip)
+                    assert idx <= COMMON_COLOR_LAST
+                    assert idx >= (1 if skip else 0)
+
+    def test_quantization_still_picks_nearest_allowed_color(self):
+        palette = load_palette("act1")
+        for skip in (False, True):
+            allowed = range(1 if skip else 0, COMMON_COLOR_LAST + 1)
+            for r, g, b in ((0, 0, 0), (255, 255, 255), (100, 80, 60), (8, 20, 16)):
+                best = min(allowed, key=lambda i, r=r, g=g, b=b: _color_distance(palette, i, r, g, b))
+                assert nearest_palette_index(r, g, b, palette, skip_transparent=skip) == best
+
+    def test_white_uses_common_color_not_255(self):
+        palette = load_palette("act1")
+        idx = nearest_palette_index(255, 255, 255, palette)
+        assert idx <= COMMON_COLOR_LAST
+        assert idx == min(COMMON_COLOR_INDICES, key=lambda i: _color_distance(palette, i, 255, 255, 255))
+
+    def test_quantization_handles_short_palette(self):
+        assert nearest_palette_index(0, 0, 0, bytes([0, 0, 0])) == 0
+        short = bytes([0, 0, 0] * 10)
+        assert nearest_palette_index(0, 0, 0, short, skip_transparent=True) in range(1, 10)
+
+    @pytest.mark.parametrize("palette_name", ["units", "act1", "loading", "menu2"])
+    @pytest.mark.parametrize("preserve_black", [False, True])
+    def test_insert_and_split_branches_stay_within_224(self, palette_name: str, preserve_black: bool):
+        """白色底最能诱使量化落到 255；插入 + 大图拆帧也必须 <=224。"""
+        img = QImage(300, 20, QImage.Format.Format_ARGB32)
+        img.fill(QColor(255, 255, 255, 255).rgba())
+        for x in range(0, 300, 3):
+            img.setPixel(x, 0, QColor(0, 0, 0, 0).rgba())
+        frames = frames_from_image(
+            img, load_palette(palette_name), 100.0, 2, preserve_black=preserve_black
+        )
+        assert len(frames) == 2
+        assert all(max(f.pixels) <= COMMON_COLOR_LAST for f in frames)
+
+    @pytest.mark.parametrize("preserve_black", [False, True])
+    def test_replace_branch_stays_within_224(self, preserve_black: bool):
+        img = QImage(32, 32, QImage.Format.Format_ARGB32)
+        img.fill(QColor(255, 255, 255, 255).rgba())
+        frames = frames_from_image(
+            img, load_palette("act1"), allow_split=False, preserve_black=preserve_black
+        )
+        assert max(frames[0].pixels) <= COMMON_COLOR_LAST
+
+    def test_rgb32_default_branch_stays_within_224(self):
+        """没有 alpha 通道的普通 RGB 图片（默认路径）同样受限。"""
+        pixels = frames_from_image(rgb_image(64, 8, (250, 250, 250)), load_palette("act1"))[0].pixels
+        assert max(pixels) <= COMMON_COLOR_LAST
+
+    def test_out_of_range_indices_are_rejected(self, monkeypatch: pytest.MonkeyPatch):
+        """即使量化层被替换/放宽，也不允许产出含 >224 索引的帧。"""
+        bad = QImage(2, 1, QImage.Format.Format_Indexed8)
+        bad.setColorCount(256)
+        bad.fill(255)
+
+        def fake_dither(*_args: object, **_kwargs: object) -> QImage:
+            return bad
+
+        monkeypatch.setattr("dc6.frame_ops.floyd_steinberg_dither", fake_dither)
+        with pytest.raises(ValueError, match="224"):
+            frames_from_image(rgb_image(2, 1, (255, 255, 255)), load_palette("act1"))
+
+    def test_preserve_black_uses_common_color_for_black_icon(self):
+        img = QImage(2, 1, QImage.Format.Format_ARGB32)
+        img.setPixel(0, 0, QColor(0, 0, 0, 0).rgba())
+        img.setPixel(1, 0, QColor(0, 0, 0, 255).rgba())
+        pixels = frames_from_image(img, load_palette("units"), preserve_black=True)[0].pixels
+        assert pixels[0] == TRANSPARENT_INDEX
+        assert pixels[1] in COMMON_COLOR_INDICES
+
+    def test_preserve_black_avoids_act_colors_with_dithering(self):
+        img = QImage(16, 16, QImage.Format.Format_ARGB32)
+        for y in range(16):
+            for x in range(16):
+                img.setPixel(x, y, QColor(x * 16, y * 16, (x + y) * 8).rgba())
+        pixels = frames_from_image(img, load_palette("act1"), preserve_black=True)[0].pixels
+        assert all(p in COMMON_COLOR_INDICES for p in pixels)
+
+
+# ---------------------------------------------------------------------------
+# 「保留黑色」导入选项（仅 alpha=0 的像素使用 0 号透明色）
+# ---------------------------------------------------------------------------
+class TestPreserveBlack:
+    @staticmethod
+    def _icon() -> QImage:
+        """一行四像素：透明黑 / 不透明黑 / 半透明黑 / 不透明白。"""
+        img = QImage(4, 1, QImage.Format.Format_ARGB32)
+        colors = [
+            QColor(0, 0, 0, 0),
+            QColor(0, 0, 0, 255),
+            QColor(0, 0, 0, 128),
+            QColor(255, 255, 255, 255),
+        ]
+        for x, color in enumerate(colors):
+            img.setPixel(x, 0, color.rgba())
+        return img
+
+    def test_default_maps_opaque_black_to_pal_zero(self):
+        """历史行为：只看 RGB，黑色与透明点都会落到 0 号色。"""
+        pixels = frames_from_image(self._icon(), load_palette("act1"))[0].pixels
+        assert list(pixels[:3]) == [0, 0, 0]
+
+    def test_preserve_black_keeps_black_visible(self):
+        pixels = frames_from_image(self._icon(), load_palette("act1"), preserve_black=True)[0].pixels
+        assert pixels[0] == 0  # 完全透明
+        assert pixels[1] != 0  # 不透明黑：不再被挖空
+        assert pixels[2] != 0  # 半透明按可见处理
+        assert pixels[3] != 0  # 白色
+
+    def test_transparent_pixel_is_zero_even_with_white_rgb(self):
+        img = QImage(2, 1, QImage.Format.Format_ARGB32)
+        img.setPixel(0, 0, QColor(255, 255, 255, 0).rgba())
+        img.setPixel(1, 0, QColor(255, 255, 255, 255).rgba())
+        palette = load_palette("act1")
+
+        default = frames_from_image(img, palette)[0].pixels
+        preserved = frames_from_image(img, palette, preserve_black=True)[0].pixels
+
+        assert default[0] != 0  # 默认忽略 alpha，透明白点被当成白色
+        assert preserved[0] == 0
+        assert preserved[1] != 0
+
+    def test_rgb_image_without_alpha_keeps_black_visible(self):
+        img = rgb_image(3, 1, (0, 0, 0))
+        pixels = frames_from_image(img, load_palette("act1"), preserve_black=True)[0].pixels
+        assert all(p != 0 for p in pixels)
+
+    def test_option_works_when_splitting_large_image(self):
+        img = QImage(300, 2, QImage.Format.Format_ARGB32)
+        img.fill(QColor(0, 0, 0, 255).rgba())
+        for x in range(300):
+            if x % 2 == 0:
+                img.setPixel(x, 0, QColor(0, 0, 0, 0).rgba())
+
+        frames = frames_from_image(img, load_palette("act1"), 100.0, 2, preserve_black=True)
+
+        assert len(frames) == 2
+        for frame in frames:
+            top_row = list(frame.pixels[: frame.width])
+            assert all(p == 0 for p in top_row[::2])  # 透明点
+            assert all(p != 0 for p in top_row[1::2])  # 黑色可见
+
+    def test_option_works_for_replace_mode(self):
+        frames = frames_from_image(
+            self._icon(), load_palette("act1"), allow_split=False, preserve_black=True
+        )
+        assert len(frames) == 1
+        assert frames[0].pixels[0] == 0
+        assert frames[0].pixels[1] != 0
+
+    def test_real_png_icon_keeps_black_and_transparency(self, tmp_path: Path):
+        src = QImage(8, 8, QImage.Format.Format_ARGB32)
+        src.fill(QColor(0, 0, 0, 0).rgba())  # 透明背景
+        for y in range(2, 6):
+            for x in range(2, 6):
+                src.setPixel(x, y, QColor(0, 0, 0, 255).rgba())  # 黑色图标
+        path = tmp_path / "icon.png"
+        assert src.save(str(path))
+
+        loaded = QImage(str(path))
+        assert loaded.hasAlphaChannel()
+        palette = load_palette("act1")
+
+        default = frames_from_image(loaded, palette)[0].pixels
+        assert default[0] == 0  # 背景
+        assert default[3 * 8 + 3] == 0  # 历史行为：黑色图标被挖空
+
+        preserved = frames_from_image(loaded, palette, preserve_black=True)[0].pixels
+        assert preserved[0] == 0
+        assert all(preserved[y * 8 + x] != 0 for y in range(2, 6) for x in range(2, 6))
+
+    def test_nearest_palette_index_can_skip_transparent_color(self):
+        palette = load_palette("act1")
+        assert nearest_palette_index(0, 0, 0, palette) == 0
+
+        idx = nearest_palette_index(0, 0, 0, palette, skip_transparent=True)
+        assert idx != 0
+        best = min(
+            range(1, COMMON_COLOR_LAST + 1),
+            key=lambda i: sum(c * c for c in palette_rgb(palette, i)),
+        )
+        assert idx == best
+
+    def test_skip_transparent_falls_back_for_single_entry_palette(self):
+        assert nearest_palette_index(0, 0, 0, bytes([0, 0, 0]), skip_transparent=True) == 0
 
 
 # ---------------------------------------------------------------------------

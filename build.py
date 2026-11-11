@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -63,6 +64,8 @@ EXCLUDE_MODULES = [
 
 def _rel(path: Path) -> str:
     """Return path relative to build/ directory."""
+    # spec 文件位于 build/ 下，目标可能在它的上一级，需要生成 "../..." 形式的路径；
+    # Path.relative_to() 无法产生 ".."，因此这里保留 os.path.relpath。
     build = ROOT / "build"
     return Path(os.path.relpath(path, build)).as_posix()
 
@@ -214,11 +217,13 @@ def _build_dc6_viewer():
 def _rmtree_force(p: Path):
     import stat
 
-    def onerror(func, path, exc_info):
-        os.chmod(path, stat.S_IWRITE)
+    # shutil.rmtree 的 onerror 回调签名固定为 (func, path, exc_info)；
+    # 这里只需把只读文件改成可写后重试，用不到异常信息。
+    def onerror(func: Callable[..., object], path: str, _exc_info: object) -> None:
+        Path(path).chmod(stat.S_IWRITE)
         func(path)
 
-    shutil.rmtree(str(p), onerror=onerror)
+    shutil.rmtree(p, onerror=onerror)
 
 
 def _merge_internal(built: list[str]):
@@ -273,7 +278,7 @@ def main():
             import uuid
 
             backup = ROOT / f"dist-{uuid.uuid4().hex[:8]}"
-            os.rename(str(DIST), str(backup))
+            DIST.rename(backup)
             print(f"Renamed old dist to {backup.name}")
 
     built: list[str] = []

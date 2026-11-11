@@ -10,18 +10,19 @@ import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QMessageBox,
     QTableWidgetItem,
     QToolBar,
     QToolButton,
@@ -31,6 +32,7 @@ from dc6 import dc6_viewer as viewer_mod
 from dc6.dc6_viewer import (
     Dc6Viewer,
     ImportDialog,
+    ImportSettings,
     OffsetDelegate,
     OffsetDialog,
     build_dc6_bytes,
@@ -74,7 +76,11 @@ class _FakeMenu:
 
 
 class _FakeMessageBox:
+    # 真实 viewer 代码会访问 QMessageBox.StandardButton，测试替身需要保留这个入口。
+    StandardButton: ClassVar[type[QMessageBox.StandardButton]] = QMessageBox.StandardButton
     calls: ClassVar[list[tuple[str, str]]] = []
+    questions: ClassVar[list[str]] = []
+    answer: ClassVar[QMessageBox.StandardButton] = QMessageBox.StandardButton.Yes
 
     @classmethod
     def critical(cls, _parent: object, title: str, message: str) -> None:
@@ -88,6 +94,19 @@ class _FakeMessageBox:
     def information(cls, _parent: object, title: str, message: str) -> None:
         cls.calls.append((title, message))
 
+    @classmethod
+    def question(
+        cls,
+        _parent: object,
+        title: str,
+        message: str,
+        _buttons: object = None,
+        _default: object = None,
+    ) -> QMessageBox.StandardButton:
+        cls.calls.append((title, message))
+        cls.questions.append(message)
+        return cls.answer
+
 
 class _FakeFileDialog:
     path: str = ""
@@ -100,6 +119,10 @@ class _FakeFileDialog:
     @classmethod
     def getSaveFileName(cls, *_args: object, **_kwargs: object) -> tuple[str, str]:  # noqa: N802
         return cls.path, cls.selected_filter
+
+    @classmethod
+    def getExistingDirectory(cls, *_args: object, **_kwargs: object) -> str:  # noqa: N802
+        return cls.path
 
 
 @pytest.fixture(scope="module")
@@ -143,6 +166,15 @@ def _add_frames(window: Dc6Viewer, count: int = 3) -> None:
     ]
     insert_frames(_model(window), 0, frames)
     window._reload_frames(select_row=0)
+
+
+def _dc6_bytes(width: int = 4, height: int = 3, x_offset: int = 0) -> bytes:
+    """生成一份能往返解析的最小 DC6 文件，供切换文件的测试使用。"""
+    dc6 = Dc6File.blank()
+    dc6.frames.append(
+        FrameInfo(width, height, x_offset=x_offset, pixels=bytearray([1] * (width * height)))
+    )
+    return build_dc6_bytes(dc6)
 
 
 def _record_frame_actions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple[object, ...]]]:
@@ -266,6 +298,60 @@ class TestImportDialog:
         assert dlg.fpr_widget.isHidden()
         assert dlg.settings()[2] == 0
         assert dlg.windowTitle() == "替换图像"
+
+    def test_black_option_can_be_prefilled(self):
+        dlg = ImportDialog("icon.png", (32, 32), ["act1"], "act1", preserve_black=True)
+        assert dlg.black_cb.isChecked()
+        assert dlg.settings().preserve_black is True
+
+    def test_black_option_defaults_off_and_is_reported(self):
+        dlg = ImportDialog("icon.png", (32, 32), ["act1"], "act1")
+        assert not dlg.black_cb.isChecked()
+        assert dlg.settings().preserve_black is False
+        assert dlg.settings()[:3] == ("act1", 100.0, 0)
+
+        dlg.black_cb.setChecked(True)
+        assert dlg.settings().preserve_black is True
+        tooltip = dlg.black_cb.toolTip()
+        assert "透明" in tooltip
+        assert "不超过 224" in tooltip  # 所有导入分支的索引上限
+
+    @pytest.mark.parametrize("checked", [False, True])
+    def test_black_option_reaches_conversion(
+        self,
+        viewer: Dc6Viewer,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        checked: bool,
+    ):
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+        monkeypatch.setattr(
+            viewer_mod.ImportDialog, "exec", lambda _self: QDialog.DialogCode.Accepted
+        )
+
+        def fake_settings(_self: ImportDialog) -> ImportSettings:
+            return ImportSettings("act1", 100.0, 0, checked)
+
+        monkeypatch.setattr(viewer_mod.ImportDialog, "settings", fake_settings)
+
+        calls: list[bool] = []
+
+        def fake_convert(
+            _img: QImage, _palette: bytes, _ratio: float, _fpr: int, **kwargs: object
+        ) -> list[FrameInfo]:
+            calls.append(bool(kwargs.get("preserve_black")))
+            return [FrameInfo(width=2, height=2, pixels=bytearray(4))]
+
+        monkeypatch.setattr(viewer_mod, "frames_from_image", fake_convert)
+
+        icon = QImage(2, 2, QImage.Format.Format_ARGB32)
+        icon.fill(QColor(0, 0, 0, 255).rgba())
+        path = tmp_path / "icon.png"
+        assert icon.save(str(path))
+        _FakeFileDialog.path = str(path)
+
+        assert viewer._choose_image_frames(allow_split=False) is not None
+        assert calls == [checked]
 
 
 class TestContextMenu:
@@ -426,3 +512,276 @@ class TestFrameActionsThroughViewer:
             assert not window.open_dir_act.isEnabled()
         finally:
             window.close()
+
+
+class TestImportOptionPersistence:
+    """「保留黑色」在确定导入后写入 QSettings，下次打开对话框自动带上。"""
+
+    def _prepare(
+        self, viewer: Dc6Viewer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[Path, list[bool], list[tuple[bool, bool]]]:
+        settings_path = tmp_path / "viewer.ini"
+        monkeypatch.setattr(viewer, "_settings", QSettings(str(settings_path), QSettings.Format.IniFormat))
+
+        icon = QImage(2, 2, QImage.Format.Format_ARGB32)
+        icon.fill(QColor(0, 0, 0, 255).rgba())
+        icon_path = tmp_path / "icon.png"
+        assert icon.save(str(icon_path))
+        _FakeFileDialog.path = str(icon_path)
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+        monkeypatch.setattr(
+            viewer_mod,
+            "frames_from_image",
+            lambda *_args, **_kwargs: [FrameInfo(2, 2, pixels=bytearray(4))],
+        )
+
+        seen: list[bool] = []  # 每次对话框创建时复选框的初始值
+        plan: list[tuple[bool, bool]] = []  # (用户最终勾选项, 是否点确定)
+        original_init = viewer_mod.ImportDialog.__init__
+
+        def spy_init(self: ImportDialog, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            seen.append(self.black_cb.isChecked())
+
+        def fake_exec(self: ImportDialog) -> QDialog.DialogCode:
+            checked, accepted = plan.pop(0)
+            self.black_cb.setChecked(checked)
+            return QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
+
+        monkeypatch.setattr(viewer_mod.ImportDialog, "__init__", spy_init)
+        monkeypatch.setattr(viewer_mod.ImportDialog, "exec", fake_exec)
+        return settings_path, seen, plan
+
+    def test_checked_option_is_prefilled_on_next_import(
+        self, viewer: Dc6Viewer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        settings_path, seen, plan = self._prepare(viewer, monkeypatch, tmp_path)
+        plan.extend([(True, True), (True, True)])
+
+        assert viewer._choose_image_frames(allow_split=True) is not None
+        assert viewer._choose_image_frames(allow_split=True) is not None
+
+        assert seen == [False, True]
+        assert viewer._remembered_preserve_black() is True
+        # 换一个 QSettings 实例读取，证明确实落盘而不只是内存里的状态。
+        fresh = QSettings(str(settings_path), QSettings.Format.IniFormat)
+        assert str(fresh.value(viewer_mod.PRESERVE_BLACK_KEY, "false")) == "true"
+
+    def test_cancel_does_not_overwrite_preference(
+        self, viewer: Dc6Viewer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        _settings_path, seen, plan = self._prepare(viewer, monkeypatch, tmp_path)
+        plan.extend([(True, True), (False, False), (False, True)])
+
+        assert viewer._choose_image_frames(allow_split=True) is not None
+        assert viewer._choose_image_frames(allow_split=True) is None  # 取消
+        assert seen == [False, True]
+        assert viewer._remembered_preserve_black() is True
+
+        assert viewer._choose_image_frames(allow_split=True) is not None
+        assert seen == [False, True, True]  # 取消的那次没有覆盖偏好
+        assert viewer._remembered_preserve_black() is False  # 确定后才更新
+
+
+@pytest.fixture
+def dirty_pair(
+    viewer: Dc6Viewer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path]:
+    """磁盘上有两个 DC6；viewer 打开第一个并留下一处未保存的修改。"""
+    first, second = tmp_path / "first.dc6", tmp_path / "second.dc6"
+    first.write_bytes(_dc6_bytes())
+    second.write_bytes(_dc6_bytes(6, 5, x_offset=11))
+
+    monkeypatch.setattr(viewer_mod, "QMessageBox", _FakeMessageBox)
+    _FakeMessageBox.calls.clear()
+    _FakeMessageBox.questions.clear()
+    _FakeMessageBox.answer = QMessageBox.StandardButton.Yes
+
+    assert viewer.load_data(first.read_bytes(), str(first))
+    _cell(viewer, 0, 2).setText("7")
+    assert viewer.windowTitle().endswith("*")
+    return first, second
+
+
+class TestUnsavedChangesOnSwitch:
+    """切换文件前的 是 / 否 / 取消 三态确认。"""
+
+    def test_yes_saves_old_file_then_switches(self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path]):
+        first, second = dirty_pair
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Yes
+
+        assert viewer.load_data(second.read_bytes(), str(second))
+
+        assert Dc6File(first.read_bytes()).frames[0].x_offset == 7
+        assert viewer._source_path == str(second)
+        assert not viewer.windowTitle().endswith("*")
+        assert len(_FakeMessageBox.questions) == 1  # 保存成功后不再重复询问
+
+    def test_no_discards_and_switches(self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path]):
+        first, second = dirty_pair
+        _FakeMessageBox.answer = QMessageBox.StandardButton.No
+
+        assert viewer.load_data(second.read_bytes(), str(second))
+
+        assert Dc6File(first.read_bytes()).frames[0].x_offset == 0
+        assert viewer._source_path == str(second)
+        assert not viewer.windowTitle().endswith("*")
+
+    def test_cancel_stays_on_current_file(self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path]):
+        first, second = dirty_pair
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Cancel
+
+        assert not viewer.load_data(second.read_bytes(), str(second))
+
+        assert viewer._source_path == str(first)
+        assert _model(viewer).frames[0].x_offset == 7
+        assert viewer.windowTitle().endswith("*")
+
+    def test_clean_document_switches_without_prompt(
+        self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path]
+    ):
+        first, second = dirty_pair
+        assert viewer._save()
+        _FakeMessageBox.questions.clear()
+
+        assert viewer.load_data(second.read_bytes(), str(second))
+        assert first.is_file()
+        assert _FakeMessageBox.questions == []
+
+    def test_failed_save_blocks_switch(
+        self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ):
+        first, second = dirty_pair
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Yes
+
+        def fail_write(_path: str) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(viewer, "_write_dc6", fail_write)
+
+        assert not viewer.load_data(second.read_bytes(), str(second))
+        assert viewer._source_path == str(first)
+        assert any(title == "保存失败" for title, _ in _FakeMessageBox.calls)
+
+    def test_cancelled_save_as_blocks_switch(
+        self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ):
+        _first, second = dirty_pair
+        viewer._source_path = None
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Yes
+        _FakeFileDialog.path = ""  # 另存为对话框被取消
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+
+        assert not viewer.load_data(second.read_bytes(), str(second))
+        assert _model(viewer).frames[0].x_offset == 7
+        assert viewer.windowTitle().endswith("*")
+
+    def test_archive_source_uses_save_as(
+        self,
+        viewer: Dc6Viewer,
+        dirty_pair: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        """MPQ 内部路径不是磁盘文件，「是」应走另存为而不是往虚拟路径写。"""
+        _first, _second = dirty_pair
+        assert viewer.load_data(_dc6_bytes(), "data\\global\\items\\icon.dc6")
+        assert viewer._source_is_virtual
+        _cell(viewer, 0, 2).setText("9")
+
+        dest = tmp_path / "exported.dc6"
+        _FakeFileDialog.path = str(dest)
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+        assert viewer._save()
+
+        assert dest.is_file()
+        assert Dc6File(dest.read_bytes()).frames[0].x_offset == 9
+        assert not viewer._source_is_virtual
+
+    def test_new_document_uses_same_guard(self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path]):
+        first, _second = dirty_pair
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Cancel
+        viewer._new_dc6()
+        assert viewer._source_path == str(first)
+
+        _FakeMessageBox.answer = QMessageBox.StandardButton.No
+        viewer._new_dc6()
+        assert viewer._source_path is None
+        assert not viewer.windowTitle().endswith("*")
+
+    def test_open_file_respects_cancel_then_yes(
+        self,
+        viewer: Dc6Viewer,
+        dirty_pair: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        first, second = dirty_pair
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+        _FakeFileDialog.path = str(second)
+
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Cancel
+        viewer._open_file()
+        assert viewer._source_path == str(first)
+
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Yes
+        viewer._open_file()
+        assert viewer._source_path == str(second)
+        assert Dc6File(first.read_bytes()).frames[0].x_offset == 7
+
+    def test_file_list_cancel_restores_highlight(
+        self, viewer: Dc6Viewer, dirty_pair: tuple[Path, Path]
+    ):
+        first, second = dirty_pair
+        viewer._populate_file_list(str(first.parent))
+        assert viewer.file_list.currentItem().text() == first.name
+
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Cancel
+        items = viewer.file_list.findItems(second.name, Qt.MatchFlag.MatchExactly)
+        viewer.file_list.setCurrentItem(items[0])
+
+        assert viewer._source_path == str(first)
+        assert viewer.file_list.currentItem().text() == first.name
+
+    def test_open_directory_cancel_then_discard(
+        self,
+        viewer: Dc6Viewer,
+        dirty_pair: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        first, _second = dirty_pair
+        other = first.parent / "other"
+        other.mkdir()
+        third = other / "third.dc6"
+        third.write_bytes(_dc6_bytes(2, 2))
+
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+        _FakeFileDialog.path = str(other)
+
+        _FakeMessageBox.answer = QMessageBox.StandardButton.Cancel
+        viewer._open_directory()
+        assert viewer.file_list.count() == 0
+        assert viewer._source_path == str(first)
+
+        _FakeMessageBox.answer = QMessageBox.StandardButton.No
+        _FakeMessageBox.questions.clear()
+        viewer._open_directory()
+        assert viewer._source_path == str(third)
+        assert len(_FakeMessageBox.questions) == 1  # 放弃后自动加载不会再问一次
+
+    def test_open_directory_discard_reloads_same_file_from_disk(
+        self,
+        viewer: Dc6Viewer,
+        dirty_pair: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """目录里就是当前文件时，「否」也要真的丢掉内存中的改动。"""
+        first, _second = dirty_pair
+        monkeypatch.setattr(viewer_mod, "QFileDialog", _FakeFileDialog)
+        _FakeFileDialog.path = str(first.parent)
+        _FakeMessageBox.answer = QMessageBox.StandardButton.No
+
+        viewer._open_directory()
+
+        assert viewer._source_path == str(first)  # 排序后 first.dc6 是第 0 行
+        assert _model(viewer).frames[0].x_offset == 0
+        assert not viewer.windowTitle().endswith("*")
